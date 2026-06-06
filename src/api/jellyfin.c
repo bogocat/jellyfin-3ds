@@ -13,7 +13,10 @@
 
 #include "api/jellyfin.h"
 #include "api/cJSON.h"
+#include "util/config.h"
 #include "util/log.h"
+
+extern jfin_config_t g_config;
 
 /* ── Internal state ────────────────────────────────────────────────── */
 
@@ -276,6 +279,15 @@ static void parse_item(const cJSON *obj, jfin_item_t *item)
     const cJSON *album_tag = cJSON_GetObjectItemCaseSensitive(obj, "AlbumPrimaryImageTag");
     item->has_album_image = (item->album_id[0] != '\0' &&
         cJSON_IsString(album_tag) && album_tag->valuestring != NULL);
+
+    /* Stereoscopic 3D format (SBS / Top-and-Bottom) */
+    const cJSON *v3d = cJSON_GetObjectItemCaseSensitive(obj, "Video3DFormat");
+    if (cJSON_IsString(v3d) && v3d->valuestring) {
+        if (strstr(v3d->valuestring, "SideBySide"))
+            item->video_3d_format = JFIN_3D_HSBS;
+        else if (strstr(v3d->valuestring, "TopAndBottom"))
+            item->video_3d_format = JFIN_3D_HTAB;
+    }
 }
 
 static void parse_item_list(const cJSON *json, jfin_item_list_t *list)
@@ -497,14 +509,15 @@ bool jfin_get_audio_stream(const jfin_session_t *session, const char *item_id,
 
     int len = snprintf(out->url, sizeof(out->url),
              "%s/Audio/%s/universal?UserId=%s&DeviceId=%s"
-             "&MaxStreamingBitrate=128000"
+             "&MaxStreamingBitrate=%d"
              "&Container=mp3,opus,ogg,aac"
              "&AudioCodec=mp3"
              "&TranscodingContainer=mp3"
              "&TranscodingProtocol=http"
              "&api_key=%s",
              session->server_url, item_id, session->user_id,
-             session->device_id, session->access_token);
+             session->device_id, g_config.audio_bitrate * 1000,
+             session->access_token);
 
     if (start_ticks > 0 && len < (int)sizeof(out->url) - 40)
         snprintf(out->url + len, sizeof(out->url) - len,
@@ -517,10 +530,16 @@ bool jfin_get_audio_stream(const jfin_session_t *session, const char *item_id,
 }
 
 bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
-                           int64_t start_ticks,
+                           int64_t start_ticks, bool is_3d,
                            jfin_stream_t *out)
 {
     memset(out, 0, sizeof(*out));
+
+    /* 3D SBS: request double-width frame so each half is ~400px.
+     * No MaxHeight — let Jellyfin preserve aspect ratio. */
+    const char *res_params = is_3d
+        ? "&MaxWidth=640"
+        : "&MaxWidth=320&MaxHeight=240";
 
     /* Unique PlaySessionId per request prevents stale transcode conflicts */
     u64 tick = svcGetSystemTick();
@@ -529,20 +548,21 @@ bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
              "&VideoCodec=h264"
              "&AudioCodec=aac"
              "&Container=ts"
-             "&MaxWidth=400&MaxHeight=240"
-             "&VideoBitRate=472000"
-             "&AudioBitRate=128000"
+             "%s"
+             "&VideoBitRate=%d"
+             "&AudioBitRate=%d"
              "&MaxAudioChannels=2"
              "&TranscodingMaxAudioChannels=2"
              "&Profile=Baseline"
              "&Level=31"
-             "&MaxRefFrames=4"
+             "&MaxRefFrames=2"
              "&MediaSourceId=%s"
              "&PlaySessionId=3ds%08lx"
              "&api_key=%s",
              session->server_url, item_id, session->user_id,
-             session->device_id, item_id,
-             (unsigned long)(tick & 0xFFFFFFFF), session->access_token);
+             session->device_id, res_params,
+             g_config.video_bitrate * 1000, g_config.audio_bitrate * 1000,
+             item_id, (unsigned long)(tick & 0xFFFFFFFF), session->access_token);
 
     if (start_ticks > 0 && len > 0 && len < (int)sizeof(out->url) - 40) {
         /* The base URL above already carries a PlaySessionId that is

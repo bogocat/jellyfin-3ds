@@ -39,7 +39,9 @@ bool config_load(jfin_config_t *config)
 {
     memset(config, 0, sizeof(*config));
     config->audio_bitrate = 128;
+    config->video_bitrate = 472;
     config->prefer_transcoding = true;
+    config->auto_advance = true;
 
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return false;
@@ -58,8 +60,16 @@ bool config_load(jfin_config_t *config)
         if (buf[0] != '\0') config->audio_bitrate = atoi(buf);
 
         buf[0] = '\0';
+        parse_line(line, "video_bitrate", buf, sizeof(buf));
+        if (buf[0] != '\0') config->video_bitrate = atoi(buf);
+
+        buf[0] = '\0';
         parse_line(line, "prefer_transcoding", buf, sizeof(buf));
         if (buf[0] != '\0') config->prefer_transcoding = (strcmp(buf, "1") == 0);
+
+        buf[0] = '\0';
+        parse_line(line, "auto_advance", buf, sizeof(buf));
+        if (buf[0] != '\0') config->auto_advance = (strcmp(buf, "1") == 0);
     }
 
     fclose(f);
@@ -79,7 +89,9 @@ bool config_save(const jfin_config_t *config)
     fprintf(f, "user_id=%s\n", config->user_id);
     fprintf(f, "device_id=%s\n", config->device_id);
     fprintf(f, "audio_bitrate=%d\n", config->audio_bitrate);
+    fprintf(f, "video_bitrate=%d\n", config->video_bitrate);
     fprintf(f, "prefer_transcoding=%d\n", config->prefer_transcoding ? 1 : 0);
+    fprintf(f, "auto_advance=%d\n", config->auto_advance ? 1 : 0);
 
     fclose(f);
     return true;

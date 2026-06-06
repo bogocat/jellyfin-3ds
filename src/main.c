@@ -97,7 +97,7 @@ int main(int argc, char *argv[])
     /* Try restoring previous session */
     memset(&s_session, 0, sizeof(s_session));
     memset(&s_ui, 0, sizeof(s_ui));
-    s_ui.auto_advance = true;  /* always auto-play next track/episode */
+    s_ui.auto_advance = g_config.auto_advance;
 
     if (try_auto_login()) {
         s_ui.current_view = VIEW_LIBRARIES;

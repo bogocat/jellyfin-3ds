@@ -24,7 +24,9 @@ typedef struct {
     char user_id[64];
     char device_id[64];
     int  audio_bitrate;      /* kbps, default 128 */
+    int  video_bitrate;      /* kbps, default 472 */
     bool prefer_transcoding; /* always transcode vs direct play */
+    bool auto_advance;       /* auto-play next track, default true */
 } jfin_config_t;
 
 /**

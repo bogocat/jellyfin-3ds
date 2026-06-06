@@ -28,6 +28,12 @@ extern "C" {
 /* ── Types ─────────────────────────────────────────────────────────── */
 
 typedef enum {
+    JFIN_3D_NONE = 0,
+    JFIN_3D_HSBS,  /* HalfSideBySide */
+    JFIN_3D_HTAB,  /* HalfTopAndBottom */
+} jfin_3d_format_t;
+
+typedef enum {
     JFIN_ITEM_FOLDER,
     JFIN_ITEM_MUSIC_ALBUM,
     JFIN_ITEM_MUSIC_ARTIST,
@@ -52,6 +58,7 @@ typedef struct {
     int64_t runtime_ticks;           /* duration in 10M ticks */
     bool has_primary_image;
     bool has_album_image;            /* album has art (for audio track fallback) */
+    jfin_3d_format_t video_3d_format; /* stereoscopic 3D format (SBS/TAB) */
 } jfin_item_t;
 
 typedef struct {
@@ -162,7 +169,7 @@ bool jfin_get_audio_stream(const jfin_session_t *session, const char *item_id,
  * Get a video stream URL. start_ticks = 0 for beginning, or seek position.
  */
 bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
-                           int64_t start_ticks,
+                           int64_t start_ticks, bool is_3d,
                            jfin_stream_t *out);
 
 

@@ -35,7 +35,7 @@
 
 /* ── Video frame queue (decode → convert thread) ───────────────────── */
 
-#define FRAME_QUEUE_SIZE 6
+#define FRAME_QUEUE_SIZE 6  /* more headroom between decode and convert */
 
 typedef struct {
     u8     *data;          /* BGR565 pixel data (allocated once) */
@@ -99,13 +99,18 @@ static struct {
     frame_queue_t   fq;
 
     /* Frame display: convert thread → main thread */
-    C3D_Tex         frame_tex[2];     /* double-buffered textures */
+    C3D_Tex         frame_tex[2];     /* double-buffered textures (left eye / 2D) */
     C2D_Image       frame_img;
     bool            tex_initialized;
     int             tex_write_idx;    /* convert writes to this */
     volatile int    tex_display_idx;  /* main thread displays this */
     volatile bool   new_tex_ready;
     LightLock       tex_lock;
+
+    /* Stereoscopic 3D (SBS) */
+    bool            is_3d;
+    C3D_Tex         frame_tex_right[2]; /* right eye double-buffered (3D only) */
+    C2D_Image       frame_img_right;
 
     /* Display dimensions */
     int             display_width;
@@ -123,6 +128,8 @@ static struct {
 static int s_inc_x[1024];
 static int s_inc_y[1024];
 static bool s_inc_tables_built = false;
+static inline void tile_row_morton(u8 *tex, int dst_row,
+                                   const u8 *src, int pixel_w);
 static Tex3DS_SubTexture s_subtex;
 
 /* ── Frame queue operations ────────────────────────────────────────── */
@@ -288,20 +295,39 @@ static void net_thread_func(void *arg)
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 65536L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/0.1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/1.0.1");
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L); /* server may need time to start transcoding */
 
-    CURLcode res = curl_easy_perform(curl);
-
+    /* Retry on transient network failures (WiFi drops, peer resets) */
+    #define NET_MAX_RETRIES 3
+    CURLcode res = CURLE_OK;
     long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    log_write("NET: curl done, result=%d (%s), http=%ld, ring_fill=%d",
-              res, curl_easy_strerror(res), http_code,
-              __atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_ACQUIRE));
 
-    if (res != CURLE_OK && !s_vp.stop_requested) {
+    for (int attempt = 0; attempt <= NET_MAX_RETRIES && !s_vp.stop_requested; attempt++) {
+        if (attempt > 0) {
+            log_write("NET: retry %d/%d after transient failure", attempt, NET_MAX_RETRIES);
+            svcSleepThread(2000000000LL); /* 2s backoff */
+        }
+
+        res = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        log_write("NET: curl done, result=%d (%s), http=%ld, ring_fill=%d attempt=%d",
+                  res, curl_easy_strerror(res), http_code,
+                  __atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_ACQUIRE), attempt);
+
+        /* Success or non-retryable: stop */
+        if (res == CURLE_OK || res == CURLE_WRITE_ERROR /* stop_requested */)
+            break;
+
+        /* Retryable: connection lost, timeout, recv error */
+        if (res != CURLE_RECV_ERROR && res != CURLE_OPERATION_TIMEDOUT
+            && res != CURLE_COULDNT_CONNECT && res != CURLE_GOT_NOTHING)
+            break;
+    }
+
+    if (res != CURLE_OK && res != CURLE_WRITE_ERROR && !s_vp.stop_requested) {
         snprintf(s_vp.error_msg, sizeof(s_vp.error_msg),
-                 "HTTP %ld: %s", http_code, curl_easy_strerror(res));
+                 "Network error: %s", curl_easy_strerror(res));
         s_vp.state = VIDEO_ERROR;
     }
 
@@ -510,8 +536,14 @@ static void decode_thread_func(void *arg)
     }
     log_write("DEC: MVD OK %dx%d", s_vp.mvd.width, s_vp.mvd.height);
 
-    s_vp.display_width = s_vp.demux.video_width;
-    s_vp.display_height = s_vp.demux.video_height;
+    if (s_vp.is_3d) {
+        /* SBS: each eye sees half the frame width */
+        s_vp.display_width = s_vp.demux.video_width / 2;
+        s_vp.display_height = s_vp.demux.video_height;
+    } else {
+        s_vp.display_width = s_vp.demux.video_width;
+        s_vp.display_height = s_vp.demux.video_height;
+    }
 
     /* Init frame queue between decode and convert threads */
     fq_init(&s_vp.fq, s_vp.mvd.width, s_vp.mvd.height);
@@ -597,6 +629,10 @@ static void convert_thread_func(void *arg)
     (void)arg;
     log_write("CONV: thread started");
 
+    /* A/V sync thresholds — wider margins reduce sleep churn */
+    const double ahead_thr  = s_vp.is_3d ? 0.025 : 0.020;
+    const double behind_thr = s_vp.is_3d ? 0.250 : 0.150;
+
     while (!s_vp.stop_requested) {
         /* Wait for a frame in the queue */
         double next_pts = fq_peek_pts(&s_vp.fq);
@@ -609,18 +645,26 @@ static void convert_thread_func(void *arg)
          * This sleep doesn't block audio because audio is decoded
          * in the decode thread, not here. */
         double audio_pos = get_audio_clock();
-        if (audio_pos >= 0 && next_pts - audio_pos > 0.003) {
-            double sleep_sec = next_pts - audio_pos - 0.0015;
+        if (audio_pos >= 0 && next_pts - audio_pos > ahead_thr) {
+            double sleep_sec = next_pts - audio_pos - (ahead_thr * 0.5);
             if (sleep_sec > 0.1) sleep_sec = 0.1;
             if (sleep_sec > 0)
                 svcSleepThread((s64)(sleep_sec * 1000000000.0));
             continue; /* re-check after sleep */
         }
 
-        /* If video is way behind audio, skip frames to catch up */
-        if (audio_pos >= 0 && audio_pos - next_pts > 0.1) {
-            fq_pop(&s_vp.fq); /* discard late frame */
-            continue;
+        /* If video is behind audio, batch-skip to latest frame.
+         * Draining the queue in one lock avoids the peek→drop→peek
+         * churn that causes visible stuttering on 3D.
+         * Fall through to tile the surviving frame immediately. */
+        if (audio_pos >= 0 && audio_pos - next_pts > behind_thr) {
+            LightLock_Lock(&s_vp.fq.lock);
+            while (s_vp.fq.count > 1) {
+                s_vp.fq.read_idx = (s_vp.fq.read_idx + 1) % FRAME_QUEUE_SIZE;
+                s_vp.fq.count--;
+            }
+            LightLock_Unlock(&s_vp.fq.lock);
+            /* fall through to pop+tile the surviving frame */
         }
 
         /* Pop the frame and tile it into a texture */
@@ -636,23 +680,45 @@ static void convert_thread_func(void *arg)
             continue;
         int write_idx = s_vp.tex_write_idx;
         if (s_vp.frame_tex[write_idx].data) {
-            u8 *tex_data = (u8 *)s_vp.frame_tex[write_idx].data;
-            int tex_w = s_vp.frame_tex[write_idx].width;
+            if (s_vp.is_3d) {
+                /* SBS 3D: single-pass interleaved tiling.
+                 * Tile both halves per row so each source row is only
+                 * fetched once from memory (hot in L1 data cache). */
+                int half_w = f->width / 2;
+                int row_bytes = f->width * 2;
+                u8 *tex_left = (u8 *)s_vp.frame_tex[write_idx].data;
+                u8 *tex_right = (u8 *)s_vp.frame_tex_right[write_idx].data;
 
-            int dst_row = 0, y_count = 0;
-            for (int y = 0; y < f->height; y++) {
-                const u8 *row = f->data + y * f->width * 2;
-                int dst_pos = dst_row, x_count = 0;
-                for (int x = 0; x < f->width; x += 2) {
-                    *(u32 *)(tex_data + dst_pos) = *(const u32 *)(row + x * 2);
-                    dst_pos += s_inc_x[x_count++];
+                int dst_row = 0, y_count = 0;
+                for (int y = 0; y < f->height; y++) {
+                    const u8 *row = f->data + y * row_bytes;
+
+                    /* Prefetch next source row into L1 cache */
+                    if (y + 1 < f->height)
+                        __builtin_prefetch(row + row_bytes, 0, 1);
+
+                    /* Left half then right half — same row, one cache fetch */
+                    tile_row_morton(tex_left, dst_row, row, half_w);
+                    tile_row_morton(tex_right, dst_row, row + half_w * 2, half_w);
+
+                    dst_row += s_inc_y[y_count++];
                 }
-                dst_row += s_inc_y[y_count++];
+                C3D_TexFlush(&s_vp.frame_tex[write_idx]);
+                C3D_TexFlush(&s_vp.frame_tex_right[write_idx]);
+            } else {
+                /* 2D: tile full frame with unrolled inner loop */
+                u8 *tex_data = (u8 *)s_vp.frame_tex[write_idx].data;
+
+                int dst_row = 0, y_count = 0;
+                for (int y = 0; y < f->height; y++) {
+                    const u8 *row = f->data + y * f->width * 2;
+                    tile_row_morton(tex_data, dst_row, row, f->width);
+                    dst_row += s_inc_y[y_count++];
+                }
+                C3D_TexFlush(&s_vp.frame_tex[write_idx]);
             }
 
-            C3D_TexFlush(&s_vp.frame_tex[write_idx]);
-
-            /* Swap: tell main thread the new texture is ready */
+            /* Swap: tell main thread the new texture(s) are ready */
             LightLock_Lock(&s_vp.tex_lock);
             s_vp.tex_display_idx = write_idx;
             s_vp.tex_write_idx = write_idx ^ 1;
@@ -674,7 +740,7 @@ static void build_offset_tables(int tex_w, int tex_h);
 static void init_frame_texture(int width, int height)
 {
     int tex_w = 512;
-    int tex_h = 256;
+    int tex_h = (height > 256) ? 512 : 256; /* 512 for 3D (tall per-eye frames) */
 
     /* Double-buffered textures: convert thread writes one while GPU reads the other */
     for (int i = 0; i < 2; i++) {
@@ -683,6 +749,20 @@ static void init_frame_texture(int width, int height)
             return;
         }
         C3D_TexSetFilter(&s_vp.frame_tex[i], GPU_LINEAR, GPU_LINEAR);
+    }
+
+    /* Right eye textures for stereoscopic 3D */
+    if (s_vp.is_3d) {
+        for (int i = 0; i < 2; i++) {
+            if (!C3D_TexInit(&s_vp.frame_tex_right[i], tex_w, tex_h, GPU_RGB565)) {
+                log_write("TEX: C3D_TexInit FAILED tex_right[%d] %dx%d", i, tex_w, tex_h);
+                C3D_TexDelete(&s_vp.frame_tex[0]);
+                C3D_TexDelete(&s_vp.frame_tex[1]);
+                if (i == 1) C3D_TexDelete(&s_vp.frame_tex_right[0]);
+                return;
+            }
+            C3D_TexSetFilter(&s_vp.frame_tex_right[i], GPU_LINEAR, GPU_LINEAR);
+        }
     }
 
     s_subtex.width = (u16)width;
@@ -697,9 +777,9 @@ static void init_frame_texture(int width, int height)
 
     /* Build offset tables for Morton tiling — must happen before
      * tex_initialized is published or the convert thread can tile
-     * with all-zero offset tables. */
+     * with all-zero offset tables. 512x512 covers both texture sizes. */
     if (!s_inc_tables_built)
-        build_offset_tables(tex_w, tex_h);
+        build_offset_tables(512, 512);
 
     /* tex_lock is initialized once in video_player_init(); re-initializing
      * it here could corrupt a lock the convert thread already holds.
@@ -707,7 +787,8 @@ static void init_frame_texture(int width, int height)
      * it (acquire) before touching any of the state set up above. */
     __atomic_store_n(&s_vp.tex_initialized, true, __ATOMIC_RELEASE);
 
-    log_write("TEX: init OK %dx%d in %dx%d tex (double buffered)", width, height, tex_w, tex_h);
+    log_write("TEX: init OK %dx%d in %dx%d tex%s", width, height, tex_w, tex_h,
+              s_vp.is_3d ? " (3D L+R)" : " (double buffered)");
 }
 
 /* Precomputed-table Morton tiling (CPU, same approach as ThirdTube).
@@ -736,6 +817,35 @@ static void build_offset_tables(int tex_w, int tex_h)
     s_inc_tables_built = true;
 }
 
+/**
+ * Tile one row of BGR565 pixels into a Morton-tiled texture.
+ * Inner loop is unrolled by 4 pixel-pairs (8 pixels) using hardcoded
+ * Morton offsets [+0, +8, +32, +40] with 128-byte group stride.
+ * Eliminates s_inc_x[] table lookups in the hot path.
+ */
+static inline void tile_row_morton(u8 *tex, int dst_row,
+                                   const u8 *src, int pixel_w)
+{
+    int groups = pixel_w >> 3; /* pixel_w / 8 */
+    int dst_pos = dst_row;
+
+    for (int g = 0; g < groups; g++) {
+        const u32 *sp = (const u32 *)(src + g * 16);
+        *(u32 *)(tex + dst_pos)      = sp[0];
+        *(u32 *)(tex + dst_pos + 8)  = sp[1];
+        *(u32 *)(tex + dst_pos + 32) = sp[2];
+        *(u32 *)(tex + dst_pos + 40) = sp[3];
+        dst_pos += 128;
+    }
+
+    /* Remainder (0-6 pixels) — fall back to table for non-8-aligned widths */
+    int x_base = groups * 8;
+    int x_count = groups * 4;
+    for (int x = x_base; x < pixel_w; x += 2) {
+        *(u32 *)(tex + dst_pos) = *(const u32 *)(src + x * 2);
+        dst_pos += s_inc_x[x_count++];
+    }
+}
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
@@ -758,14 +868,17 @@ void video_player_cleanup(void)
     video_player_stop();
 }
 
-bool video_player_play(const char *url, int64_t duration_ticks, int64_t seek_offset_ticks)
+bool video_player_play(const char *url, int64_t duration_ticks,
+                       int64_t seek_offset_ticks, bool is_3d)
 {
-    log_write("PLAY: starting video, url_len=%d seek=%lld", (int)strlen(url), (long long)seek_offset_ticks);
+    log_write("PLAY: starting video, url_len=%d seek=%lld 3d=%d",
+              (int)strlen(url), (long long)seek_offset_ticks, is_3d);
     video_player_stop();
 
     snprintf(s_vp.url, sizeof(s_vp.url), "%s", url);
     s_vp.duration_ticks = duration_ticks;
     s_vp.seek_offset_ticks = seek_offset_ticks;
+    s_vp.is_3d = is_3d;
     s_vp.position_ticks = seek_offset_ticks;
     s_vp.error_msg[0] = '\0';
     s_vp.stop_requested = false;
@@ -882,12 +995,18 @@ void video_player_stop(void)
     if (s_vp.tex_initialized) {
         C3D_TexDelete(&s_vp.frame_tex[0]);
         C3D_TexDelete(&s_vp.frame_tex[1]);
+        if (s_vp.is_3d) {
+            C3D_TexDelete(&s_vp.frame_tex_right[0]);
+            C3D_TexDelete(&s_vp.frame_tex_right[1]);
+        }
         /* RELAXED is sufficient (convert thread already joined) but keep
          * every cross-thread write to tex_initialized atomic for consistency */
         __atomic_store_n(&s_vp.tex_initialized, false, __ATOMIC_RELAXED);
     }
     /* Don't let the next playback render a frame from the previous video */
     s_vp.frame_img.tex = NULL;
+    s_vp.frame_img_right.tex = NULL;
+    s_vp.is_3d = false;
 
     s_vp.state = VIDEO_STOPPED;
 }
@@ -930,6 +1049,7 @@ video_status_t video_player_get_status(void)
     st.display_fps = s_vp.display_fps;
     st.frames_decoded = s_vp.frames_decoded;
     st.frames_displayed = s_vp.frames_displayed;
+    st.is_3d = s_vp.is_3d;
     snprintf(st.error_msg, sizeof(st.error_msg), "%s", s_vp.error_msg);
     return st;
 }
@@ -951,17 +1071,60 @@ void video_player_render_frame(void)
         /* Point the C2D image at the newly completed texture */
         s_vp.frame_img.tex = &s_vp.frame_tex[s_vp.tex_display_idx];
         s_vp.frame_img.subtex = &s_subtex;
+        if (s_vp.is_3d) {
+            s_vp.frame_img_right.tex = &s_vp.frame_tex_right[s_vp.tex_display_idx];
+            s_vp.frame_img_right.subtex = &s_subtex;
+        }
         s_vp.new_tex_ready = false;
         render_log_count++;
         if (render_log_count <= 3)
-            log_write("RENDER: displaying tex[%d] frame#%d", s_vp.tex_display_idx, render_log_count);
+            log_write("RENDER: displaying tex[%d] frame#%d%s",
+                      s_vp.tex_display_idx, render_log_count,
+                      s_vp.is_3d ? " (3D)" : "");
     }
     LightLock_Unlock(&s_vp.tex_lock);
 
-    /* Draw the frame texture on the top screen — zero upload cost */
+    /* Draw the frame texture on the top screen */
     if (s_vp.tex_initialized && s_vp.frame_img.tex) {
-        float x = (400 - s_vp.display_width) / 2.0f;
-        float y = (240 - s_vp.display_height) / 2.0f;
-        C2D_DrawImageAt(s_vp.frame_img, x, y, 0.5f, NULL, 1.0f, 1.0f);
+        if (s_vp.is_3d) {
+            /* HalfSBS: stretch 2x horizontally to restore AR, then fit screen */
+            float logical_w = s_vp.display_width * 2.0f;
+            float logical_h = (float)s_vp.display_height;
+            float scale = 400.0f / logical_w;
+            if (logical_h * scale > 240.0f)
+                scale = 240.0f / logical_h;
+            float sx = 2.0f * scale;
+            float sy = scale;
+            float rw = s_vp.display_width * sx;
+            float rh = s_vp.display_height * sy;
+            float x = (400.0f - rw) / 2.0f;
+            float y = (240.0f - rh) / 2.0f;
+            C2D_DrawImageAt(s_vp.frame_img, x, y, 0.5f, NULL, sx, sy);
+        } else {
+            float x = (400 - s_vp.display_width) / 2.0f;
+            float y = (240 - s_vp.display_height) / 2.0f;
+            C2D_DrawImageAt(s_vp.frame_img, x, y, 0.5f, NULL, 1.0f, 1.0f);
+        }
     }
+}
+
+void video_player_render_frame_right(void)
+{
+    if (!s_vp.is_3d) return;
+    if (s_vp.state != VIDEO_PLAYING && s_vp.state != VIDEO_PAUSED) return;
+    if (!s_vp.tex_initialized || !s_vp.frame_img_right.tex) return;
+
+    /* Same scaling as left eye */
+    float logical_w = s_vp.display_width * 2.0f;
+    float logical_h = (float)s_vp.display_height;
+    float scale = 400.0f / logical_w;
+    if (logical_h * scale > 240.0f)
+        scale = 240.0f / logical_h;
+    float sx = 2.0f * scale;
+    float sy = scale;
+    float rw = s_vp.display_width * sx;
+    float rh = s_vp.display_height * sy;
+    float x = (400.0f - rw) / 2.0f;
+    float y = (240.0f - rh) / 2.0f;
+    C2D_DrawImageAt(s_vp.frame_img_right, x, y, 0.5f, NULL, sx, sy);
 }

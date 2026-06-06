@@ -30,13 +30,18 @@ extern "C" {
 #define UI_FONT_SIZE_SMALL   11
 
 /* ── Colors (RGBA8) ──────────────────────────────────────────────── */
-#define COLOR_BG_DARK       0x1A1A2EFF
-#define COLOR_BG_CARD       0x16213EFF
-#define COLOR_PRIMARY       0x00A8E8FF
-#define COLOR_TEXT_PRIMARY   0xE0E0E0FF
-#define COLOR_TEXT_SECONDARY 0x888888FF
-#define COLOR_ACCENT         0x7B2CBFFF
-#define COLOR_HIGHLIGHT      0x00A8E840  /* semi-transparent selection */
+#define COLOR_BG_DARK        0x1E1E2EFF   /* warmer dark background */
+#define COLOR_BG_CARD        0x2A2A3CFF   /* more contrast with bg */
+#define COLOR_PRIMARY        0x6C9BD2FF   /* muted steel blue */
+#define COLOR_TEXT_PRIMARY   0xE8E8E8FF   /* slightly brighter white */
+#define COLOR_TEXT_SECONDARY 0x9898A8FF   /* warmer mid-gray */
+#define COLOR_ACCENT         0xC084FCFF   /* soft lavender */
+#define COLOR_HIGHLIGHT      0x6C9BD230   /* matches primary, 19% alpha */
+
+/* Settings-specific colors */
+#define COLOR_SEPARATOR      0x3A3A4CFF   /* subtle divider lines */
+#define COLOR_VALUE          0xA8D8A8FF   /* muted green for values */
+#define COLOR_DANGER         0xE88888FF   /* soft red for logout */
 
 /* ── Screens / Views ─────────────────────────────────────────────── */
 
@@ -45,6 +50,7 @@ typedef enum {
     VIEW_LIBRARIES,      /* top-level library list */
     VIEW_BROWSE,         /* browsing items within a library */
     VIEW_NOW_PLAYING,    /* audio playback screen */
+    VIEW_SETTINGS,       /* settings / account / about */
 } ui_view_t;
 
 /* ── UI State ────────────────────────────────────────────────────── */
@@ -82,6 +88,10 @@ typedef struct {
     bool         touch_held;
     int          touch_start_y;
     int          scroll_velocity;
+
+    /* Settings */
+    int          settings_index;   /* cursor position in settings list */
+    int          settings_scroll;  /* scroll offset */
 } ui_state_t;
 
 /* ── Lifecycle ───────────────────────────────────────────────────── */
@@ -116,6 +126,7 @@ void ui_render_login(const ui_state_t *state);
 void ui_render_libraries(const ui_state_t *state);
 void ui_render_browse(const ui_state_t *state);
 void ui_render_now_playing(const ui_state_t *state, const player_status_t *player);
+void ui_render_settings(const ui_state_t *state, const jfin_session_t *session);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 

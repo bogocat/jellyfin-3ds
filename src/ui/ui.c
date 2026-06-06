@@ -25,8 +25,9 @@ extern jfin_config_t g_config;
 
 /* ── Render targets ────────────────────────────────────────────────── */
 
-static C3D_RenderTarget *s_top    = NULL;
-static C3D_RenderTarget *s_bottom = NULL;
+static C3D_RenderTarget *s_top       = NULL;
+static C3D_RenderTarget *s_top_right = NULL;  /* right eye for stereoscopic 3D */
+static C3D_RenderTarget *s_bottom    = NULL;
 static C2D_TextBuf       s_text_buf = NULL;
 static C2D_Font          s_font = NULL;
 
@@ -63,14 +64,60 @@ static void format_ticks(int64_t ticks, char *out, int out_len)
     snprintf(out, out_len, "%d:%02d", min, sec);
 }
 
+/* ── Selection style helper ────────────────────────────────────────── */
+
+static void draw_list_item_bg(float y, float w, float h, bool selected)
+{
+    u32 bg = selected ? rgba(COLOR_HIGHLIGHT) : rgba(COLOR_BG_CARD);
+    draw_rect(5, y, w, h, bg);
+    if (selected)
+        draw_rect(5, y, 3, h, rgba(COLOR_PRIMARY));  /* left accent bar */
+}
+
+/* ── Settings items ───────────────────────────────────────────────── */
+
+enum {
+    SET_AUDIO_BITRATE,
+    SET_VIDEO_BITRATE,
+    SET_AUTO_ADVANCE,
+    SET_SEPARATOR_ACCOUNT,   /* non-selectable divider */
+    SET_SERVER,              /* display-only */
+    SET_USERNAME,            /* display-only */
+    SET_LOGOUT,              /* action */
+    SET_SEPARATOR_ABOUT,     /* non-selectable divider */
+    SET_VERSION,             /* display-only */
+    SET_DEVICE_ID,           /* display-only */
+    SET_COUNT
+};
+
+static const int audio_rates[] = {64, 128, 192, 256};
+static const int video_rates[] = {256, 472, 768};
+#define AUDIO_RATES_COUNT (int)(sizeof(audio_rates) / sizeof(audio_rates[0]))
+#define VIDEO_RATES_COUNT (int)(sizeof(video_rates) / sizeof(video_rates[0]))
+
+static bool settings_is_separator(int idx)
+{
+    return idx == SET_SEPARATOR_ACCOUNT || idx == SET_SEPARATOR_ABOUT;
+}
+
+static int settings_next_selectable(int from, int dir)
+{
+    int n = from + dir;
+    while (n >= 0 && n < SET_COUNT && settings_is_separator(n))
+        n += dir;
+    if (n < 0 || n >= SET_COUNT) return from;
+    return n;
+}
+
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
 bool ui_init(void)
 {
     s_top = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    s_top_right = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
     s_bottom = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
 
-    if (!s_top || !s_bottom) return false;
+    if (!s_top || !s_top_right || !s_bottom) return false;
 
     s_text_buf = C2D_TextBufNew(4096);
     if (!s_text_buf) return false;
@@ -286,10 +333,11 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                 if (is_playable) {
                     if (is_video && video_player_is_supported()) {
                         /* Video playback on New 3DS */
+                        bool is_3d = (item->video_3d_format == JFIN_3D_HSBS);
                         audio_player_stop();
                         jfin_stream_t stream;
-                        if (jfin_get_video_stream(session, item->id, 0, &stream) &&
-                            video_player_play(stream.url, item->runtime_ticks, 0)) {
+                        if (jfin_get_video_stream(session, item->id, 0, is_3d, &stream) &&
+                            video_player_play(stream.url, item->runtime_ticks, 0, is_3d)) {
                             state->now_playing = *item;
                             state->has_now_playing = true;
                             state->playing_index = state->selected_index;
@@ -371,19 +419,24 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
             state->previous_view = state->current_view;
             state->current_view = VIEW_NOW_PLAYING;
         }
-        /* SELECT to search */
+        /* SELECT: settings in libraries, search in browse */
         if (kdown & KEY_SELECT) {
-            SwkbdState swkbd;
-            char query[128] = {0};
-            swkbdInit(&swkbd, SWKBD_TYPE_WESTERN, 2, 127);
-            swkbdSetHintText(&swkbd, "Search...");
-            SwkbdButton button = swkbdInputText(&swkbd, query, sizeof(query));
-            if (button == SWKBD_BUTTON_CONFIRM && query[0] != '\0') {
-                jfin_search(session, query, JFIN_MAX_ITEMS, &state->items);
-                state->selected_index = 0;
-                state->scroll_offset = 0;
-                state->current_view = VIEW_BROWSE;
-                /* Don't push to breadcrumb -- search results are a flat list */
+            if (state->current_view == VIEW_LIBRARIES) {
+                state->settings_index = 0;
+                state->settings_scroll = 0;
+                state->current_view = VIEW_SETTINGS;
+            } else {
+                SwkbdState swkbd;
+                char query[128] = {0};
+                swkbdInit(&swkbd, SWKBD_TYPE_WESTERN, 2, 127);
+                swkbdSetHintText(&swkbd, "Search...");
+                SwkbdButton button = swkbdInputText(&swkbd, query, sizeof(query));
+                if (button == SWKBD_BUTTON_CONFIRM && query[0] != '\0') {
+                    jfin_search(session, query, JFIN_MAX_ITEMS, &state->items);
+                    state->selected_index = 0;
+                    state->scroll_offset = 0;
+                    state->current_view = VIEW_BROWSE;
+                }
             }
         }
         /* Auto-advance: when current track/episode finishes, play next */
@@ -404,11 +457,12 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                     bool next_is_video = (next_item->type == JFIN_ITEM_MOVIE ||
                                           next_item->type == JFIN_ITEM_EPISODE);
                     if (next_playable) {
+                        bool next_is_3d = (next_item->video_3d_format == JFIN_3D_HSBS);
                         jfin_stream_t stream;
                         bool started = false;
                         if (next_is_video && video_player_is_supported()) {
-                            if (jfin_get_video_stream(session, next_item->id, 0, &stream) &&
-                                video_player_play(stream.url, next_item->runtime_ticks, 0)) {
+                            if (jfin_get_video_stream(session, next_item->id, 0, next_is_3d, &stream) &&
+                                video_player_play(stream.url, next_item->runtime_ticks, 0, next_is_3d)) {
                                 started = true;
                             } else if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
                                 audio_player_play(stream.url, next_item->runtime_ticks, 0);
@@ -490,9 +544,10 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
 
                 jfin_stream_t stream;
                 if (vid_active) {
+                    bool is_3d = (state->now_playing.video_3d_format == JFIN_3D_HSBS);
                     video_player_stop();
-                    if (jfin_get_video_stream(session, state->now_playing.id, new_pos, &stream))
-                        video_player_play(stream.url, state->now_playing.runtime_ticks, new_pos);
+                    if (jfin_get_video_stream(session, state->now_playing.id, new_pos, is_3d, &stream))
+                        video_player_play(stream.url, state->now_playing.runtime_ticks, new_pos, is_3d);
                 } else {
                     audio_player_stop();
                     if (jfin_get_audio_stream(session, state->now_playing.id, new_pos, &stream))
@@ -529,11 +584,12 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                         bool next_is_video = (next_item->type == JFIN_ITEM_MOVIE ||
                                               next_item->type == JFIN_ITEM_EPISODE);
                         if (next_playable) {
+                            bool next_is_3d = (next_item->video_3d_format == JFIN_3D_HSBS);
                             jfin_stream_t stream;
                             bool started = false;
                             if (next_is_video && video_player_is_supported()) {
-                                if (jfin_get_video_stream(session, next_item->id, 0, &stream) &&
-                                    video_player_play(stream.url, next_item->runtime_ticks, 0)) {
+                                if (jfin_get_video_stream(session, next_item->id, 0, next_is_3d, &stream) &&
+                                    video_player_play(stream.url, next_item->runtime_ticks, 0, next_is_3d)) {
                                     started = true;
                                 } else if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
                                     audio_player_play(stream.url, next_item->runtime_ticks, 0);
@@ -550,7 +606,7 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                                 state->playing_index = next;
                                 state->auto_stopped = false;
                                 jfin_report_start(session, next_item->id);
-                            album_art_load(session, next_item);
+                                album_art_load(session, next_item);
                             } else {
                                 state->has_now_playing = false;
                                 state->current_view = state->previous_view;
@@ -565,6 +621,65 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                     }
                 }
             }
+        }
+        break;
+
+    case VIEW_SETTINGS:
+        /* D-pad up/down: move cursor, skip separators */
+        if (kdown & KEY_DUP)
+            state->settings_index = settings_next_selectable(state->settings_index, -1);
+        if (kdown & KEY_DDOWN)
+            state->settings_index = settings_next_selectable(state->settings_index, 1);
+
+        /* Scroll to keep cursor visible */
+        if (state->settings_index < state->settings_scroll)
+            state->settings_scroll = state->settings_index;
+        if (state->settings_index >= state->settings_scroll + UI_MAX_VISIBLE_ITEMS)
+            state->settings_scroll = state->settings_index - UI_MAX_VISIBLE_ITEMS + 1;
+
+        /* L/R: cycle selector values */
+        if ((kdown & KEY_DLEFT) || (kdown & KEY_DRIGHT) ||
+            (kdown & KEY_L) || (kdown & KEY_R)) {
+            int dir = ((kdown & KEY_DRIGHT) || (kdown & KEY_R)) ? 1 : -1;
+            if (state->settings_index == SET_AUDIO_BITRATE) {
+                int cur = 0;
+                for (int i = 0; i < AUDIO_RATES_COUNT; i++)
+                    if (g_config.audio_bitrate == audio_rates[i]) { cur = i; break; }
+                cur = (cur + dir + AUDIO_RATES_COUNT) % AUDIO_RATES_COUNT;
+                g_config.audio_bitrate = audio_rates[cur];
+            } else if (state->settings_index == SET_VIDEO_BITRATE) {
+                int cur = 0;
+                for (int i = 0; i < VIDEO_RATES_COUNT; i++)
+                    if (g_config.video_bitrate == video_rates[i]) { cur = i; break; }
+                cur = (cur + dir + VIDEO_RATES_COUNT) % VIDEO_RATES_COUNT;
+                g_config.video_bitrate = video_rates[cur];
+            }
+        }
+
+        /* A: toggle booleans, activate actions */
+        if (kdown & KEY_A) {
+            if (state->settings_index == SET_AUTO_ADVANCE) {
+                g_config.auto_advance = !g_config.auto_advance;
+                state->auto_advance = g_config.auto_advance;
+            } else if (state->settings_index == SET_LOGOUT) {
+                jfin_session_t *s = (jfin_session_t *)session;
+                jfin_logout(s);
+                g_config.access_token[0] = '\0';
+                config_save(&g_config);
+                state->current_view = VIEW_LOGIN;
+                if (g_config.server_url[0] != '\0')
+                    snprintf(state->server_url, sizeof(state->server_url),
+                             "%s", g_config.server_url);
+            }
+        }
+
+        /* B: save and return to libraries */
+        if (kdown & KEY_B) {
+            config_save(&g_config);
+            state->current_view = VIEW_LIBRARIES;
+            jfin_get_views(session, &state->items);
+            state->selected_index = 0;
+            state->scroll_offset = 0;
         }
         break;
     }
@@ -678,15 +793,14 @@ void ui_render_libraries(const ui_state_t *state)
         if (idx >= state->items.count) break;
 
         float y = 30 + i * UI_LIST_ITEM_HEIGHT;
-        u32 bg = (idx == state->selected_index) ? rgba(COLOR_HIGHLIGHT) : rgba(COLOR_BG_CARD);
-        draw_rect(5, y, 310, UI_LIST_ITEM_HEIGHT - 4, bg);
+        draw_list_item_bg(y, 310, UI_LIST_ITEM_HEIGHT - 4, idx == state->selected_index);
 
         draw_text(15, y + 10, 0.55f, rgba(COLOR_TEXT_PRIMARY),
                   state->items.items[idx].name);
     }
 
     draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY),
-              "A:Enter B:Back Y:Playing SEL:Search");
+              "A:Enter B:Back Y:Playing SEL:Settings");
 }
 
 void ui_render_browse(const ui_state_t *state)
@@ -708,8 +822,7 @@ void ui_render_browse(const ui_state_t *state)
         float y = 25 + i * UI_LIST_ITEM_HEIGHT;
         const jfin_item_t *item = &state->items.items[idx];
 
-        u32 bg = (idx == state->selected_index) ? rgba(COLOR_HIGHLIGHT) : rgba(COLOR_BG_CARD);
-        draw_rect(5, y, 310, UI_LIST_ITEM_HEIGHT - 4, bg);
+        draw_list_item_bg(y, 310, UI_LIST_ITEM_HEIGHT - 4, idx == state->selected_index);
 
         /* Item name */
         char label[160];
@@ -795,6 +908,13 @@ void ui_render_now_playing(const ui_state_t *state, const player_status_t *playe
     } else if (is_video) {
         /* Render video frame on top screen */
         video_player_render_frame();
+
+        /* Right eye for stereoscopic 3D (only when 3D slider is up) */
+        if (vstatus.is_3d && osGet3DSliderState() > 0.0f) {
+            C2D_TargetClear(s_top_right, rgba(0x000000FF));
+            C2D_SceneBegin(s_top_right);
+            video_player_render_frame_right();
+        }
     } else if (player->state == PLAYER_LOADING) {
         /* Show buffering indicator while audio is loading */
         draw_text(130, 100, 0.7f, rgba(COLOR_PRIMARY), "Buffering...");
@@ -881,8 +1001,9 @@ void ui_render_now_playing(const ui_state_t *state, const player_status_t *playe
 
     /* Diagnostics for video playback */
     if (is_video) {
-        char diag[64];
-        snprintf(diag, sizeof(diag), "Dec: %.0f fps  Disp: %.0f fps  %dx%d",
+        char diag[80];
+        snprintf(diag, sizeof(diag), "%sDec: %.0f fps  Disp: %.0f fps  %dx%d",
+                 vstatus.is_3d ? "3D  " : "",
                  vstatus.decode_fps, vstatus.display_fps,
                  vstatus.video_width, vstatus.video_height);
         draw_text(30, 125, 0.38f, rgba(COLOR_TEXT_SECONDARY), diag);
@@ -893,12 +1014,97 @@ void ui_render_now_playing(const ui_state_t *state, const player_status_t *playe
               "A:Pause X:Stop B:Back L/R:Seek");
 }
 
+void ui_render_settings(const ui_state_t *state, const jfin_session_t *session)
+{
+    C2D_TargetClear(s_bottom, rgba(COLOR_BG_DARK));
+    C2D_SceneBegin(s_bottom);
+
+    draw_text(10, 5, 0.55f, rgba(COLOR_PRIMARY), "Settings");
+
+    for (int i = 0; i < UI_MAX_VISIBLE_ITEMS + 1 && i + state->settings_scroll < SET_COUNT; i++) {
+        int idx = state->settings_scroll + i;
+        float y = 30 + i * UI_LIST_ITEM_HEIGHT;
+
+        if (settings_is_separator(idx)) {
+            /* Separator: thin line + label */
+            float line_y = y + UI_LIST_ITEM_HEIGHT / 2;
+            draw_rect(10, line_y, 300, 1, rgba(COLOR_SEPARATOR));
+            const char *sep_label = (idx == SET_SEPARATOR_ACCOUNT) ? "Account" : "About";
+            draw_text(15, line_y + 4, 0.4f, rgba(COLOR_TEXT_SECONDARY), sep_label);
+            continue;
+        }
+
+        bool selected = (idx == state->settings_index);
+        draw_list_item_bg(y, 310, UI_LIST_ITEM_HEIGHT - 4, selected);
+
+        /* Label + value per item */
+        const char *label = "";
+        char value[128] = {0};
+        u32 value_color = rgba(COLOR_VALUE);
+
+        switch (idx) {
+        case SET_AUDIO_BITRATE:
+            label = "Audio Bitrate";
+            snprintf(value, sizeof(value), "%d kbps", g_config.audio_bitrate);
+            break;
+        case SET_VIDEO_BITRATE:
+            label = "Video Bitrate";
+            snprintf(value, sizeof(value), "%d kbps", g_config.video_bitrate);
+            break;
+        case SET_AUTO_ADVANCE:
+            label = "Auto-advance";
+            snprintf(value, sizeof(value), "%s", g_config.auto_advance ? "On" : "Off");
+            break;
+        case SET_SERVER:
+            label = "Server";
+            snprintf(value, sizeof(value), "%.30s%s",
+                     session->server_url,
+                     strlen(session->server_url) > 30 ? "..." : "");
+            value_color = rgba(COLOR_TEXT_SECONDARY);
+            break;
+        case SET_USERNAME:
+            label = "User";
+            snprintf(value, sizeof(value), "%s", g_config.username);
+            value_color = rgba(COLOR_TEXT_SECONDARY);
+            break;
+        case SET_LOGOUT:
+            label = "Logout";
+            value_color = rgba(COLOR_DANGER);
+            break;
+        case SET_VERSION:
+            label = "Version";
+            snprintf(value, sizeof(value), "v" JFIN_VERSION);
+            value_color = rgba(COLOR_TEXT_SECONDARY);
+            break;
+        case SET_DEVICE_ID:
+            label = "Device";
+            snprintf(value, sizeof(value), "%.18s%s",
+                     g_config.device_id,
+                     strlen(g_config.device_id) > 18 ? "..." : "");
+            value_color = rgba(COLOR_TEXT_SECONDARY);
+            break;
+        }
+
+        draw_text(15, y + 10, 0.5f,
+                  idx == SET_LOGOUT ? rgba(COLOR_DANGER) : rgba(COLOR_TEXT_PRIMARY),
+                  label);
+        if (value[0])
+            draw_text(200, y + 10, 0.45f, value_color, value);
+    }
+
+    draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY),
+              "A:Toggle L/R:Change B:Back");
+}
+
 /* ── Main render dispatch ──────────────────────────────────────────── */
 
 void ui_render(const ui_state_t *state, const jfin_session_t *session,
                const player_status_t *player)
 {
-    (void)session;
+    /* Enable stereoscopic 3D only during active 3D video playback */
+    video_status_t vs_3d = video_player_get_status();
+    gfxSet3D(state->current_view == VIEW_NOW_PLAYING && vs_3d.is_3d &&
+             vs_3d.state != VIDEO_STOPPED);
 
     C2D_TextBufClear(s_text_buf);
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
@@ -935,6 +1141,9 @@ void ui_render(const ui_state_t *state, const jfin_session_t *session,
         break;
     case VIEW_NOW_PLAYING:
         /* Already rendered above (both screens) */
+        break;
+    case VIEW_SETTINGS:
+        ui_render_settings(state, session);
         break;
     }
 

@@ -36,6 +36,7 @@ typedef struct {
     int      frames_decoded;
     int      frames_displayed;
     char     error_msg[128];
+    bool     is_3d;
 } video_status_t;
 
 /**
@@ -58,7 +59,8 @@ void video_player_cleanup(void);
  * Start video playback from a TS stream URL.
  * seek_offset_ticks: position in the original media this stream starts from.
  */
-bool video_player_play(const char *url, int64_t duration_ticks, int64_t seek_offset_ticks);
+bool video_player_play(const char *url, int64_t duration_ticks,
+                       int64_t seek_offset_ticks, bool is_3d);
 
 /**
  * Stop playback.
@@ -80,6 +82,12 @@ video_status_t video_player_get_status(void);
  * Handles frame display on the top screen.
  */
 void video_player_render_frame(void);
+
+/**
+ * Render the right-eye frame for stereoscopic 3D.
+ * Call after video_player_render_frame() within the right-eye scene.
+ */
+void video_player_render_frame_right(void);
 
 #ifdef __cplusplus
 }
