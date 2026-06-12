@@ -167,9 +167,21 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
     case VIEW_LIBRARIES:
     case VIEW_BROWSE:
         /* D-pad navigation with hold-to-repeat: ~270ms initial delay,
-         * then one step every other frame (~15 items/s at 30fps). */
+         * then one step every other frame (~15 items/s at 30fps).
+         * Statics instead of ui_state_t fields: keeps this out of the
+         * header while the wip UI branch is active; ui_update is
+         * main-thread only so there is no reentrancy concern. */
         {
             static int dpad_repeat_frames = 0;
+            static int dpad_last_view = -1;
+
+            /* Entering this view with the D-pad already held must not
+             * inherit a matured timer from the previous view */
+            if (dpad_last_view != (int)state->current_view) {
+                dpad_repeat_frames = 0;
+                dpad_last_view = (int)state->current_view;
+            }
+
             bool nav_up = (kdown & KEY_DUP) != 0;
             bool nav_down = (kdown & KEY_DDOWN) != 0;
 
