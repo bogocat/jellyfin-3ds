@@ -56,36 +56,8 @@ bool demux_init(demux_ctx_t *ctx)
 {
     AVFormatContext *fmt_ctx = NULL;
     AVIOContext *avio_ctx = NULL;
+    int ret;
 
-    /* Allocate AVIO buffer */
-    ctx->avio_buf = av_malloc(AVIO_BUF_SIZE);
-    if (!ctx->avio_buf)
-        return false;
-
-    /* Create custom AVIO context that reads from our ring buffer */
-    avio_ctx = avio_alloc_context(
-        ctx->avio_buf, AVIO_BUF_SIZE,
-        0,            /* write_flag = 0 (read-only) */
-        ctx,          /* opaque */
-        ring_read_for_avio,
-        NULL,         /* write callback */
-        NULL          /* seek callback — no seeking for live TS */
-    );
-    if (!avio_ctx) {
-        av_free(ctx->avio_buf);
-        return false;
-    }
-
-    /* Allocate format context */
-    fmt_ctx = avformat_alloc_context();
-    if (!fmt_ctx) {
-        avio_context_free(&avio_ctx);
-        return false;
-    }
-    fmt_ctx->pb = avio_ctx;
-    fmt_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
-
-    /* Probe and open the TS stream */
     const AVInputFormat *input_fmt = av_find_input_format("mpegts");
 
     /* Speed up format detection: 32KB probe + 0.5s analysis is enough for TS */
@@ -93,11 +65,51 @@ bool demux_init(demux_ctx_t *ctx)
     av_dict_set(&opts, "probesize", "32768", 0);
     av_dict_set(&opts, "analyzeduration", "500000", 0);
 
-    int ret = avformat_open_input(&fmt_ctx, NULL, input_fmt, &opts);
-    av_dict_free(&opts);
-    if (ret < 0) {
-        avio_context_free(&avio_ctx);
-        return false;
+    if (ctx->local_path) {
+        /* Cached file on SD: open via FFmpeg's file protocol (newlib
+         * routes open/read/lseek to the sdmc devoptab). Seekable —
+         * no ring buffer, no custom AVIO. */
+        ret = avformat_open_input(&fmt_ctx, ctx->local_path, input_fmt, &opts);
+        av_dict_free(&opts);
+        if (ret < 0)
+            return false;
+    } else {
+        /* Network stream: custom AVIO over the curl-fed ring buffer */
+        ctx->avio_buf = av_malloc(AVIO_BUF_SIZE);
+        if (!ctx->avio_buf) {
+            av_dict_free(&opts);
+            return false;
+        }
+
+        avio_ctx = avio_alloc_context(
+            ctx->avio_buf, AVIO_BUF_SIZE,
+            0,            /* write_flag = 0 (read-only) */
+            ctx,          /* opaque */
+            ring_read_for_avio,
+            NULL,         /* write callback */
+            NULL          /* seek callback — no seeking for live TS */
+        );
+        if (!avio_ctx) {
+            av_free(ctx->avio_buf);
+            av_dict_free(&opts);
+            return false;
+        }
+
+        fmt_ctx = avformat_alloc_context();
+        if (!fmt_ctx) {
+            avio_context_free(&avio_ctx);
+            av_dict_free(&opts);
+            return false;
+        }
+        fmt_ctx->pb = avio_ctx;
+        fmt_ctx->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+        ret = avformat_open_input(&fmt_ctx, NULL, input_fmt, &opts);
+        av_dict_free(&opts);
+        if (ret < 0) {
+            avio_context_free(&avio_ctx);
+            return false;
+        }
     }
 
     /* Find stream info */
@@ -149,6 +161,25 @@ int demux_read_packet(demux_ctx_t *ctx, AVPacket *pkt, bool *is_video)
 
     *is_video = (pkt->stream_index == ctx->video_stream_idx);
     return 0;
+}
+
+bool demux_seek(demux_ctx_t *ctx, int64_t position_ticks)
+{
+    if (!ctx->fmt_ctx || !ctx->local_path)
+        return false; /* network streams seek via StartTimeTicks restart */
+
+    AVFormatContext *fmt_ctx = (AVFormatContext *)ctx->fmt_ctx;
+    /* Jellyfin ticks are 100ns; av_seek_frame with stream -1 wants
+     * AV_TIME_BASE (microseconds). BACKWARD lands on the prior keyframe
+     * so MVD starts from a clean IDR (TS carries SPS/PPS inline). */
+    int64_t ts_us = position_ticks / 10;
+    int ret = av_seek_frame(fmt_ctx, -1, ts_us, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0) {
+        /* Some TS files only resolve timestamps approximately */
+        ret = av_seek_frame(fmt_ctx, -1, ts_us,
+                            AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY);
+    }
+    return ret >= 0;
 }
 
 void demux_cleanup(demux_ctx_t *ctx)

@@ -19,6 +19,7 @@
 #include "audio/player.h"
 #include "video/video_player.h"
 #include "ui/ui.h"
+#include "util/cache.h"
 #include "util/config.h"
 #include "util/log.h"
 
@@ -86,6 +87,7 @@ int main(int argc, char *argv[])
     /* Load config */
     config_load(&g_config);
     config_ensure_device_id(&g_config);
+    cache_init(); /* index offline downloads, sweep stale .part files */
 
     /* Init subsystems — if any fail, exit gracefully */
     if (!jfin_init() || !audio_player_init() || !ui_init()) {

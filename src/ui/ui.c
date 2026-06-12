@@ -18,8 +18,11 @@
 #include "audio/player.h"
 #include "video/video_player.h"
 #include "ui/album_art.h"
+#include "util/cache.h"
 #include "util/config.h"
 #include "util/log.h"
+
+#include <curl/curl.h>
 
 extern jfin_config_t g_config;
 
@@ -75,6 +78,225 @@ static vp_3d_mode_t item_3d_mode(const jfin_item_t *item)
     }
 }
 
+/* ── Playback / offline-cache helpers ──────────────────────────────── */
+
+static bool item_is_video(const jfin_item_t *item)
+{
+    return item->type == JFIN_ITEM_MOVIE || item->type == JFIN_ITEM_EPISODE;
+}
+
+static bool item_is_playable(const jfin_item_t *item)
+{
+    return item->type == JFIN_ITEM_AUDIO || item_is_video(item);
+}
+
+static const char *item_cache_ext(const jfin_item_t *item)
+{
+    return item_is_video(item) ? "ts" : "mp3";
+}
+
+/* Cache size shown in settings — refreshed on entry/clear, never per-frame
+ * (cache_total_bytes walks the SD directory) */
+static u64 s_cache_bytes_ui;
+
+/**
+ * Start playback of a playable item, preferring the offline cache.
+ * Covers: video with audio-stream fallback, audio/Old-3DS path, playback
+ * reporting, album art, and now-playing state. View transitions stay at
+ * the call sites (browse switches to now-playing; auto-advance doesn't).
+ */
+static bool ui_start_item(ui_state_t *state, const jfin_session_t *session,
+                          const jfin_item_t *item, int item_index,
+                          int64_t start_ticks)
+{
+    jfin_stream_t stream;
+    char cpath[512];
+    bool started = false;
+
+    if (item_is_video(item) && video_player_is_supported()) {
+        vp_3d_mode_t mode_3d = item_3d_mode(item);
+        audio_player_stop();
+        if (cache_has(item->id, "ts") &&
+            cache_path(item->id, "ts", cpath, sizeof(cpath))) {
+            /* Local files seek in-place, so start_ticks passes through */
+            started = video_player_play(cpath, item->runtime_ticks,
+                                        start_ticks, mode_3d);
+        } else if (jfin_get_video_stream(session, item->id, start_ticks,
+                                         mode_3d != VP_3D_NONE, &stream)) {
+            started = video_player_play(stream.url, item->runtime_ticks,
+                                        start_ticks, mode_3d);
+        }
+    }
+
+    if (!started) {
+        /* Audio track, Old 3DS, or the video path failed.
+         * Cached audio can't seek locally (mpg123 feed API), so a
+         * non-zero start position falls back to streaming. */
+        video_player_stop();
+        if (start_ticks == 0 && cache_has(item->id, "mp3") &&
+            cache_path(item->id, "mp3", cpath, sizeof(cpath))) {
+            started = audio_player_play(cpath, item->runtime_ticks, 0);
+        } else if (jfin_get_audio_stream(session, item->id, start_ticks, &stream)) {
+            started = audio_player_play(stream.url, item->runtime_ticks,
+                                        start_ticks);
+        }
+    }
+
+    if (started) {
+        state->now_playing = *item;
+        state->has_now_playing = true;
+        state->playing_index = item_index;
+        state->auto_stopped = false;
+        jfin_report_start(session, item->id);
+        album_art_load(session, item);
+    }
+    return started;
+}
+
+/* ── Modal download (blocking, B cancels) ──────────────────────────── */
+
+typedef struct {
+    FILE              *fp;
+    const jfin_item_t *item;
+    int64_t            est_total;  /* runtime x bitrate estimate (bytes) */
+    u64                last_render_ms;
+    bool               cancelled;
+} dl_ctx_t;
+
+static size_t dl_file_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
+{
+    dl_ctx_t *dl = (dl_ctx_t *)ud;
+    return fwrite(ptr, size, nmemb, dl->fp);
+}
+
+static void dl_render_progress(dl_ctx_t *dl, s64 dlnow)
+{
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C2D_TextBufClear(s_text_buf);
+    C2D_TargetClear(s_bottom, rgba(COLOR_BG_DARK));
+    C2D_SceneBegin(s_bottom);
+    draw_text(10, 10, 0.6f, rgba(COLOR_PRIMARY), "Downloading");
+    draw_text(10, 40, 0.5f, rgba(COLOR_TEXT_PRIMARY), dl->item->name);
+
+    char line[96];
+    double mb = (double)dlnow / (1024.0 * 1024.0);
+    if (dl->est_total > 0) {
+        int pct = (int)((double)dlnow * 100.0 / (double)dl->est_total);
+        if (pct > 99) pct = 99; /* size is an estimate — never claim done */
+        draw_rect(20, 80, 280, 8, rgba(COLOR_BG_CARD));
+        draw_rect(20, 80, 280.0f * pct / 100.0f, 8, rgba(COLOR_PRIMARY));
+        snprintf(line, sizeof(line), "%.1f MB  (~%d%%)", mb, pct);
+    } else {
+        snprintf(line, sizeof(line), "%.1f MB", mb);
+    }
+    draw_text(20, 100, 0.5f, rgba(COLOR_VALUE), line);
+    draw_text(10, 140, 0.4f, rgba(COLOR_TEXT_SECONDARY),
+              "Keep the lid open — closing it drops WiFi.");
+    draw_text(10, 210, 0.45f, rgba(COLOR_TEXT_SECONDARY), "B: cancel");
+    C3D_FrameEnd(0);
+}
+
+static int dl_progress_cb(void *ud, curl_off_t dltotal, curl_off_t dlnow,
+                          curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)dltotal; (void)ultotal; (void)ulnow;
+    dl_ctx_t *dl = (dl_ctx_t *)ud;
+
+    hidScanInput();
+    if (hidKeysDown() & KEY_B) {
+        dl->cancelled = true;
+        return 1; /* abort the transfer */
+    }
+
+    u64 now = osGetTime();
+    if (now - dl->last_render_ms >= 250) {
+        dl->last_render_ms = now;
+        dl_render_progress(dl, (s64)dlnow);
+    }
+    return 0;
+}
+
+static void ui_download_item(const jfin_session_t *session,
+                             const jfin_item_t *item)
+{
+    const char *ext = item_cache_ext(item);
+    jfin_stream_t stream;
+    bool ok_url;
+    if (item_is_video(item)) {
+        vp_3d_mode_t mode_3d = item_3d_mode(item);
+        ok_url = jfin_get_video_stream(session, item->id, 0,
+                                       mode_3d != VP_3D_NONE, &stream);
+    } else {
+        ok_url = jfin_get_audio_stream(session, item->id, 0, &stream);
+    }
+    if (!ok_url) return;
+
+    char part[512], final_path[512];
+    if (!cache_part_path(item->id, ext, part, sizeof(part)) ||
+        !cache_path(item->id, ext, final_path, sizeof(final_path)))
+        return;
+
+    dl_ctx_t dl = {0};
+    dl.item = item;
+    dl.fp = fopen(part, "wb");
+    if (!dl.fp) {
+        log_write("DL: fopen failed: %s", part);
+        return;
+    }
+
+    /* Transcoded streams carry no Content-Length; estimate from
+     * runtime x configured bitrate for the progress bar */
+    int kbps = item_is_video(item)
+        ? g_config.video_bitrate + g_config.audio_bitrate
+        : g_config.audio_bitrate;
+    if (item->runtime_ticks > 0 && kbps > 0)
+        dl.est_total = item->runtime_ticks / 10000000LL * kbps * 1000 / 8;
+
+    dl_render_progress(&dl, 0);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fclose(dl.fp);
+        remove(part);
+        return;
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, stream.url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dl_file_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &dl);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/" JFIN_VERSION);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    /* Server-side transcode throttling can slow the stream to ~realtime;
+     * only abort if it stalls outright for a minute */
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, dl_progress_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &dl);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    fclose(dl.fp);
+
+    if (res == CURLE_OK && http_code >= 200 && http_code < 300) {
+        remove(final_path); /* replace an older copy if re-downloading */
+        if (rename(part, final_path) == 0) {
+            cache_index_add(item->id, ext);
+            log_write("DL: cached %s.%s", item->id, ext);
+        } else {
+            log_write("DL: rename failed for %s", part);
+            remove(part);
+        }
+    } else {
+        remove(part);
+        log_write("DL: %s res=%d http=%ld",
+                  dl.cancelled ? "cancelled" : "failed", res, http_code);
+    }
+}
+
 /* ── Selection style helper ────────────────────────────────────────── */
 
 static void draw_list_item_bg(float y, float w, float h, bool selected)
@@ -91,6 +313,7 @@ enum {
     SET_AUDIO_BITRATE,
     SET_VIDEO_BITRATE,
     SET_AUTO_ADVANCE,
+    SET_CACHE_CLEAR,         /* action: clear offline cache */
     SET_SEPARATOR_ACCOUNT,   /* non-selectable divider */
     SET_SERVER,              /* display-only */
     SET_USERNAME,            /* display-only */
@@ -339,52 +562,11 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                                      item->type == JFIN_ITEM_MUSIC_ARTIST ||
                                      item->type == JFIN_ITEM_SERIES ||
                                      item->type == JFIN_ITEM_SEASON);
-                bool is_video = (item->type == JFIN_ITEM_MOVIE ||
-                                 item->type == JFIN_ITEM_EPISODE);
                 if (is_playable) {
-                    if (is_video && video_player_is_supported()) {
-                        /* Video playback on New 3DS */
-                        vp_3d_mode_t mode_3d = item_3d_mode(item);
-                        audio_player_stop();
-                        jfin_stream_t stream;
-                        if (jfin_get_video_stream(session, item->id, 0,
-                                                  mode_3d != VP_3D_NONE, &stream) &&
-                            video_player_play(stream.url, item->runtime_ticks, 0, mode_3d)) {
-                            state->now_playing = *item;
-                            state->has_now_playing = true;
-                            state->playing_index = state->selected_index;
-                            state->auto_stopped = false;
-                            state->previous_view = state->current_view;
-                            state->current_view = VIEW_NOW_PLAYING;
-                            jfin_report_start(session, item->id);
-                                album_art_load(session, item);
-                        } else {
-                            /* Video failed — fall back to audio */
-                            if (jfin_get_audio_stream(session, item->id, 0, &stream)) {
-                                audio_player_play(stream.url, item->runtime_ticks, 0);
-                                state->now_playing = *item;
-                                state->has_now_playing = true;
-                                state->playing_index = state->selected_index;
-                                state->auto_stopped = false;
-                                jfin_report_start(session, item->id);
-                                album_art_load(session, item);
-                            }
-                        }
-                    } else {
-                        /* Audio-only (music, or video on Old 3DS) */
-                        video_player_stop(); /* stop any video playback */
-                        jfin_stream_t stream;
-                        if (jfin_get_audio_stream(session, item->id, 0, &stream)) {
-                            audio_player_play(stream.url, item->runtime_ticks, 0);
-                            state->now_playing = *item;
-                            state->has_now_playing = true;
-                            state->playing_index = state->selected_index;
-                            state->auto_stopped = false;
-                            state->previous_view = state->current_view;
-                            state->current_view = VIEW_NOW_PLAYING;
-                            jfin_report_start(session, item->id);
-                            album_art_load(session, item);
-                        }
+                    if (ui_start_item(state, session, item,
+                                      state->selected_index, 0)) {
+                        state->previous_view = state->current_view;
+                        state->current_view = VIEW_NOW_PLAYING;
                     }
                 } else if (is_container) {
                     ui_navigate_into(state, session, item);
@@ -395,6 +577,20 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
         /* B to go back */
         if (kdown & KEY_B) {
             ui_navigate_back(state, session);
+        }
+        /* X: download to / remove from the offline cache */
+        if ((kdown & KEY_X) && state->selected_index < state->items.count) {
+            jfin_item_t *item = &state->items.items[state->selected_index];
+            /* Video on Old 3DS can't be played, so don't cache it either */
+            bool cacheable = item_is_playable(item) &&
+                             (!item_is_video(item) || video_player_is_supported());
+            if (cacheable) {
+                const char *ext = item_cache_ext(item);
+                if (cache_has(item->id, ext))
+                    cache_remove(item->id, ext);
+                else
+                    ui_download_item(session, item);
+            }
         }
         /* L/R for pagination */
         if (kdown & KEY_R) {
@@ -436,6 +632,7 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
             if (state->current_view == VIEW_LIBRARIES) {
                 state->settings_index = 0;
                 state->settings_scroll = 0;
+                s_cache_bytes_ui = cache_total_bytes(); /* one dir walk on entry */
                 state->current_view = VIEW_SETTINGS;
             } else {
                 SwkbdState swkbd;
@@ -460,45 +657,11 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
 
             if (audio_finished || video_finished) {
                 int next = state->playing_index + 1;
-                if (next < state->items.count) {
-                    jfin_item_t *next_item = &state->items.items[next];
-                    /* Only auto-advance to same playable type */
-                    bool next_playable = (next_item->type == JFIN_ITEM_AUDIO ||
-                                          next_item->type == JFIN_ITEM_MOVIE ||
-                                          next_item->type == JFIN_ITEM_EPISODE);
-                    bool next_is_video = (next_item->type == JFIN_ITEM_MOVIE ||
-                                          next_item->type == JFIN_ITEM_EPISODE);
-                    if (next_playable) {
-                        vp_3d_mode_t next_mode = item_3d_mode(next_item);
-                        jfin_stream_t stream;
-                        bool started = false;
-                        if (next_is_video && video_player_is_supported()) {
-                            if (jfin_get_video_stream(session, next_item->id, 0,
-                                                      next_mode != VP_3D_NONE, &stream) &&
-                                video_player_play(stream.url, next_item->runtime_ticks, 0, next_mode)) {
-                                started = true;
-                            } else if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
-                                audio_player_play(stream.url, next_item->runtime_ticks, 0);
-                                started = true;
-                            }
-                        } else {
-                            if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
-                                audio_player_play(stream.url, next_item->runtime_ticks, 0);
-                                started = true;
-                            }
-                        }
-                        if (started) {
-                            state->now_playing = *next_item;
-                            state->playing_index = next;
-                            state->auto_stopped = false;
-                            jfin_report_start(session, next_item->id);
-                            album_art_load(session, next_item);
-                        } else {
-                            state->has_now_playing = false;
-                        }
-                    } else {
+                if (next < state->items.count &&
+                    item_is_playable(&state->items.items[next])) {
+                    if (!ui_start_item(state, session,
+                                       &state->items.items[next], next, 0))
                         state->has_now_playing = false;
-                    }
                 } else {
                     state->has_now_playing = false;
                 }
@@ -555,18 +718,14 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                 if (new_pos >= state->now_playing.runtime_ticks)
                     new_pos = state->now_playing.runtime_ticks - 100000000LL; /* 10s before end */
 
-                jfin_stream_t stream;
-                if (vid_active) {
-                    vp_3d_mode_t mode_3d = item_3d_mode(&state->now_playing);
+                /* ui_start_item picks cache vs stream; cached video seeks
+                 * in-place on the SD file (no transcode restart) */
+                if (vid_active)
                     video_player_stop();
-                    if (jfin_get_video_stream(session, state->now_playing.id, new_pos,
-                                              mode_3d != VP_3D_NONE, &stream))
-                        video_player_play(stream.url, state->now_playing.runtime_ticks, new_pos, mode_3d);
-                } else {
+                else
                     audio_player_stop();
-                    if (jfin_get_audio_stream(session, state->now_playing.id, new_pos, &stream))
-                        audio_player_play(stream.url, state->now_playing.runtime_ticks, new_pos);
-                }
+                ui_start_item(state, session, &state->now_playing,
+                              state->playing_index, new_pos);
             }
             /* B to go back to browse */
             if (kdown & KEY_B) {
@@ -590,47 +749,13 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
 
                 if (audio_done || video_done) {
                     int next = state->playing_index + 1;
-                    if (next < state->items.count) {
-                        jfin_item_t *next_item = &state->items.items[next];
-                        bool next_playable = (next_item->type == JFIN_ITEM_AUDIO ||
-                                              next_item->type == JFIN_ITEM_MOVIE ||
-                                              next_item->type == JFIN_ITEM_EPISODE);
-                        bool next_is_video = (next_item->type == JFIN_ITEM_MOVIE ||
-                                              next_item->type == JFIN_ITEM_EPISODE);
-                        if (next_playable) {
-                            vp_3d_mode_t next_mode = item_3d_mode(next_item);
-                            jfin_stream_t stream;
-                            bool started = false;
-                            if (next_is_video && video_player_is_supported()) {
-                                if (jfin_get_video_stream(session, next_item->id, 0,
-                                                          next_mode != VP_3D_NONE, &stream) &&
-                                    video_player_play(stream.url, next_item->runtime_ticks, 0, next_mode)) {
-                                    started = true;
-                                } else if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
-                                    audio_player_play(stream.url, next_item->runtime_ticks, 0);
-                                    started = true;
-                                }
-                            } else {
-                                if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
-                                    audio_player_play(stream.url, next_item->runtime_ticks, 0);
-                                    started = true;
-                                }
-                            }
-                            if (started) {
-                                state->now_playing = *next_item;
-                                state->playing_index = next;
-                                state->auto_stopped = false;
-                                jfin_report_start(session, next_item->id);
-                                album_art_load(session, next_item);
-                            } else {
-                                state->has_now_playing = false;
-                                state->current_view = state->previous_view;
-                            }
-                        } else {
-                            state->has_now_playing = false;
-                            state->current_view = state->previous_view;
-                        }
-                    } else {
+                    bool advanced = false;
+                    if (next < state->items.count &&
+                        item_is_playable(&state->items.items[next]))
+                        advanced = ui_start_item(state, session,
+                                                 &state->items.items[next],
+                                                 next, 0);
+                    if (!advanced) {
                         state->has_now_playing = false;
                         state->current_view = state->previous_view;
                     }
@@ -676,6 +801,9 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
             if (state->settings_index == SET_AUTO_ADVANCE) {
                 g_config.auto_advance = !g_config.auto_advance;
                 state->auto_advance = g_config.auto_advance;
+            } else if (state->settings_index == SET_CACHE_CLEAR) {
+                cache_clear();
+                s_cache_bytes_ui = 0;
             } else if (state->settings_index == SET_LOGOUT) {
                 jfin_session_t *s = (jfin_session_t *)session;
                 jfin_logout(s);
@@ -839,15 +967,20 @@ void ui_render_browse(const ui_state_t *state)
 
         draw_list_item_bg(y, 310, UI_LIST_ITEM_HEIGHT - 4, idx == state->selected_index);
 
-        /* Item name (3D badge for stereoscopic content) */
+        /* Item name + badges: [3D] stereoscopic, [SD] in the offline cache */
         const char *badge = (item->video_3d_format != JFIN_3D_NONE) ? " [3D]" : "";
+        const char *sd_badge = (item_is_playable(item) &&
+                                cache_has(item->id, item_cache_ext(item)))
+                               ? " [SD]" : "";
         char label[160];
         if (item->type == JFIN_ITEM_AUDIO && item->index_number > 0) {
-            snprintf(label, sizeof(label), "%d. %s%s", item->index_number, item->name, badge);
+            snprintf(label, sizeof(label), "%d. %s%s%s",
+                     item->index_number, item->name, badge, sd_badge);
         } else if (item->type == JFIN_ITEM_EPISODE && item->index_number > 0) {
-            snprintf(label, sizeof(label), "E%d - %s%s", item->index_number, item->name, badge);
+            snprintf(label, sizeof(label), "E%d - %s%s%s",
+                     item->index_number, item->name, badge, sd_badge);
         } else {
-            snprintf(label, sizeof(label), "%s%s", item->name, badge);
+            snprintf(label, sizeof(label), "%s%s%s", item->name, badge, sd_badge);
         }
 
         draw_text(15, y + 4, 0.5f, rgba(COLOR_TEXT_PRIMARY), label);
@@ -888,9 +1021,9 @@ void ui_render_browse(const ui_state_t *state)
     }
 
     if (state->items.total_count > JFIN_MAX_ITEMS)
-        draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY), "A:Sel B:Back L/R:Pg SEL:Search");
+        draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY), "A:Sel B:Back X:DL L/R:Pg SEL:Srch");
     else
-        draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY), "A:Sel B:Back Y:Playing SEL:Search");
+        draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY), "A:Sel B:Back X:DL Y:Play SEL:Srch");
 }
 
 void ui_render_now_playing(const ui_state_t *state, const player_status_t *player)
@@ -1070,6 +1203,11 @@ void ui_render_settings(const ui_state_t *state, const jfin_session_t *session)
         case SET_AUTO_ADVANCE:
             label = "Auto-advance";
             snprintf(value, sizeof(value), "%s", g_config.auto_advance ? "On" : "Off");
+            break;
+        case SET_CACHE_CLEAR:
+            label = "Offline Cache";
+            snprintf(value, sizeof(value), "%llu MB  A: clear",
+                     (unsigned long long)(s_cache_bytes_ui / (1024 * 1024)));
             break;
         case SET_SERVER:
             label = "Server";

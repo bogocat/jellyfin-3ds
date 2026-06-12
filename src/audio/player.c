@@ -162,9 +162,41 @@ static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *userda
 
 /* ── Network thread ────────────────────────────────────────────────── */
 
+/* Cached file on SD: pump it into the ring buffer in place of curl.
+ * Everything downstream (mpg123 feed, NDSP) is identical. */
+static void local_file_to_ring(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(s_player.error_msg, sizeof(s_player.error_msg),
+                 "Cache file open failed");
+        s_player.state = PLAYER_ERROR;
+        return;
+    }
+
+    u8 buf[8192];
+    while (!s_player.stop_requested) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n == 0) break; /* EOF or read error */
+        size_t written = 0;
+        while (written < n && !s_player.stop_requested) {
+            written += ring_write(&s_player.ring, buf + written, n - written);
+            if (written < n)
+                svcSleepThread(1000000LL); /* 1ms — ring full */
+        }
+    }
+    fclose(f);
+}
+
 static void net_thread_func(void *arg)
 {
     (void)arg;
+
+    if (strncmp(s_player.url, "http", 4) != 0) {
+        local_file_to_ring(s_player.url);
+        __atomic_store_n(&s_player.ring.finished, true, __ATOMIC_RELEASE);
+        return;
+    }
 
     CURL *curl = curl_easy_init();
     if (!curl) {

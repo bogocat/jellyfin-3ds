@@ -61,7 +61,7 @@ src/
 | D-Pad  | Field select | List navigate | — |
 | A      | Edit field | Enter/Play | Pause/Resume |
 | B      | — | Back | Return to browse |
-| X      | — | — | Stop playback |
+| X      | — | Cache: download / delete | Stop playback |
 | Y      | — | Now Playing view | — |
 | R      | Connect | — | — |
 | START  | Exit | Exit | Exit |

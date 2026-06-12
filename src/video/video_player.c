@@ -110,6 +110,10 @@ static struct {
     /* Stereoscopic 3D (SBS) */
     bool            is_3d;             /* mode_3d != VP_3D_NONE */
     vp_3d_mode_t    mode_3d;
+
+    /* Offline cache: url is an sdmc:/ path, played without the network
+     * thread or ring buffer (FFmpeg opens the file directly, seekable) */
+    bool            is_local;
     C3D_Tex         frame_tex_right[2]; /* right eye double-buffered (3D only) */
     C2D_Image       frame_img_right;
 
@@ -519,20 +523,25 @@ static void decode_audio_packet(AVPacket *pkt)
 static void decode_thread_func(void *arg)
 {
     (void)arg;
-    log_write("DEC: thread started, waiting for prefetch (%d bytes)", PREFETCH_BYTES);
 
-    /* Wait for prefetch */
-    while (!s_vp.stop_requested) {
-        if (__atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_ACQUIRE) >= PREFETCH_BYTES
-            || __atomic_load_n(&s_vp.demux.ring_finished, __ATOMIC_ACQUIRE))
-            break;
-        svcSleepThread(10000000LL); /* 10ms */
+    if (!s_vp.is_local) {
+        log_write("DEC: thread started, waiting for prefetch (%d bytes)", PREFETCH_BYTES);
+
+        /* Wait for prefetch */
+        while (!s_vp.stop_requested) {
+            if (__atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_ACQUIRE) >= PREFETCH_BYTES
+                || __atomic_load_n(&s_vp.demux.ring_finished, __ATOMIC_ACQUIRE))
+                break;
+            svcSleepThread(10000000LL); /* 10ms */
+        }
+        if (s_vp.stop_requested) { log_write("DEC: stop during prefetch"); return; }
+
+        log_write("DEC: prefetch done, fill=%d finished=%d",
+                  __atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_ACQUIRE),
+                  __atomic_load_n(&s_vp.demux.ring_finished, __ATOMIC_ACQUIRE));
+    } else {
+        log_write("DEC: thread started (local file, no prefetch)");
     }
-    if (s_vp.stop_requested) { log_write("DEC: stop during prefetch"); return; }
-
-    log_write("DEC: prefetch done, fill=%d finished=%d",
-              __atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_ACQUIRE),
-              __atomic_load_n(&s_vp.demux.ring_finished, __ATOMIC_ACQUIRE));
 
     /* Init demuxer */
     if (!demux_init(&s_vp.demux)) {
@@ -540,6 +549,21 @@ static void decode_thread_func(void *arg)
         snprintf(s_vp.error_msg, sizeof(s_vp.error_msg), "Demux init failed");
         s_vp.state = VIDEO_ERROR;
         return;
+    }
+
+    /* Local files seek in-place instead of restarting the transcode.
+     * After a successful seek the file's own PTS already reflect the
+     * position, so the additive seek offset must be zeroed. */
+    if (s_vp.is_local && s_vp.seek_offset_ticks > 0) {
+        if (demux_seek(&s_vp.demux, s_vp.seek_offset_ticks)) {
+            log_write("DEC: local seek to %lld ticks OK",
+                      (long long)s_vp.seek_offset_ticks);
+            s_vp.seek_offset_ticks = 0;
+        } else {
+            log_write("DEC: local seek FAILED, playing from start");
+            s_vp.seek_offset_ticks = 0;
+            s_vp.position_ticks = 0;
+        }
     }
     log_write("DEC: demux OK video=%dx%d vidx=%d aidx=%d",
               s_vp.demux.video_width, s_vp.demux.video_height,
@@ -907,14 +931,20 @@ bool video_player_play(const char *url, int64_t duration_ticks,
     s_vp.new_tex_ready = false;
     s_vp.audio_buf_idx = 0;
 
-    /* Allocate ring buffer */
-    s_vp.demux.ring_data = malloc(RING_SIZE);
-    if (!s_vp.demux.ring_data) return false;
-    s_vp.demux.ring_size = RING_SIZE;
-    s_vp.demux.ring_write_pos = 0;
-    s_vp.demux.ring_read_pos = 0;
-    s_vp.demux.ring_fill = 0;
-    s_vp.demux.ring_finished = false;
+    /* Anything that isn't http(s) is a cached file on the SD card */
+    s_vp.is_local = (strncmp(url, "http", 4) != 0);
+    s_vp.demux.local_path = s_vp.is_local ? s_vp.url : NULL;
+
+    if (!s_vp.is_local) {
+        /* Allocate ring buffer (network playback only) */
+        s_vp.demux.ring_data = malloc(RING_SIZE);
+        if (!s_vp.demux.ring_data) return false;
+        s_vp.demux.ring_size = RING_SIZE;
+        s_vp.demux.ring_write_pos = 0;
+        s_vp.demux.ring_read_pos = 0;
+        s_vp.demux.ring_fill = 0;
+        s_vp.demux.ring_finished = false;
+    }
 
     /* Reset NDSP channel. Set the channel field now rather than in
      * init_audio_decoder so a stop() before audio init doesn't clear
@@ -927,14 +957,16 @@ bool video_player_play(const char *url, int64_t duration_ticks,
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
     log_write("PLAY: creating threads, prio=%ld", (long)prio);
 
-    s_vp.net_thread = threadCreate(net_thread_func, NULL,
-                                    32 * 1024, prio - 1, -1, false);
+    if (!s_vp.is_local)
+        s_vp.net_thread = threadCreate(net_thread_func, NULL,
+                                        32 * 1024, prio - 1, -1, false);
     s_vp.decode_thread = threadCreate(decode_thread_func, NULL,
                                        64 * 1024, prio - 1, -1, false);
     s_vp.convert_thread = threadCreate(convert_thread_func, NULL,
                                         32 * 1024, prio, -1, false);
 
-    if (!s_vp.net_thread || !s_vp.decode_thread || !s_vp.convert_thread) {
+    if ((!s_vp.net_thread && !s_vp.is_local) ||
+        !s_vp.decode_thread || !s_vp.convert_thread) {
         snprintf(s_vp.error_msg, sizeof(s_vp.error_msg),
                  "Thread create failed (net=%p dec=%p)",
                  (void*)s_vp.net_thread, (void*)s_vp.decode_thread);
@@ -1029,6 +1061,8 @@ void video_player_stop(void)
     s_vp.frame_img_right.tex = NULL;
     s_vp.is_3d = false;
     s_vp.mode_3d = VP_3D_NONE;
+    s_vp.is_local = false;
+    s_vp.demux.local_path = NULL;
 
     s_vp.state = VIDEO_STOPPED;
 }
@@ -1052,7 +1086,8 @@ video_status_t video_player_get_status(void)
     st.state = s_vp.state;
     st.position_ticks = s_vp.position_ticks;
     st.duration_ticks = s_vp.duration_ticks;
-    st.buffer_percent = (s_vp.demux.ring_size > 0)
+    st.buffer_percent = s_vp.is_local ? 100
+        : (s_vp.demux.ring_size > 0)
         ? (__atomic_load_n(&s_vp.demux.ring_fill, __ATOMIC_RELAXED) * 100 / s_vp.demux.ring_size) : 0;
     st.video_width = s_vp.display_width;
     st.video_height = s_vp.display_height;
