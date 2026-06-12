@@ -280,11 +280,15 @@ static void parse_item(const cJSON *obj, jfin_item_t *item)
     item->has_album_image = (item->album_id[0] != '\0' &&
         cJSON_IsString(album_tag) && album_tag->valuestring != NULL);
 
-    /* Stereoscopic 3D format (SBS / Top-and-Bottom) */
+    /* Stereoscopic 3D format. Half vs Full SBS matters: each HSBS eye is
+     * anamorphic (needs a 2x horizontal stretch at display time), each
+     * FSBS eye is already at native aspect. */
     const cJSON *v3d = cJSON_GetObjectItemCaseSensitive(obj, "Video3DFormat");
     if (cJSON_IsString(v3d) && v3d->valuestring) {
-        if (strstr(v3d->valuestring, "SideBySide"))
+        if (strcmp(v3d->valuestring, "HalfSideBySide") == 0)
             item->video_3d_format = JFIN_3D_HSBS;
+        else if (strcmp(v3d->valuestring, "FullSideBySide") == 0)
+            item->video_3d_format = JFIN_3D_FSBS;
         else if (strstr(v3d->valuestring, "TopAndBottom"))
             item->video_3d_format = JFIN_3D_HTAB;
     }
@@ -535,11 +539,13 @@ bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
 {
     memset(out, 0, sizeof(*out));
 
-    /* 3D SBS: request double-width frame so each half is ~400px.
-     * No MaxHeight — let Jellyfin preserve aspect ratio. */
+    /* 3D SBS: request a double-width frame so each eye half is ~400px
+     * (native top-screen width). No MaxHeight — let Jellyfin preserve
+     * the aspect ratio. If hardware decode/tiling can't keep up at 800,
+     * 640 is the fallback knob (each eye 320, upscaled). */
     const char *res_params = is_3d
-        ? "&MaxWidth=640"
-        : "&MaxWidth=320&MaxHeight=240";
+        ? "&MaxWidth=800"
+        : "&MaxWidth=400&MaxHeight=240";
 
     /* Unique PlaySessionId per request prevents stale transcode conflicts */
     u64 tick = svcGetSystemTick();

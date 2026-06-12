@@ -39,6 +39,13 @@ typedef struct {
     bool     is_3d;
 } video_status_t;
 
+/* Stereoscopic mode for side-by-side content */
+typedef enum {
+    VP_3D_NONE = 0,
+    VP_3D_HSBS,  /* half-width SBS: stretch each eye 2x horizontally */
+    VP_3D_FSBS,  /* full-width SBS: each eye already at native aspect */
+} vp_3d_mode_t;
+
 /**
  * Check if the current hardware supports video playback (New 3DS).
  */
@@ -60,7 +67,7 @@ void video_player_cleanup(void);
  * seek_offset_ticks: position in the original media this stream starts from.
  */
 bool video_player_play(const char *url, int64_t duration_ticks,
-                       int64_t seek_offset_ticks, bool is_3d);
+                       int64_t seek_offset_ticks, vp_3d_mode_t mode_3d);
 
 /**
  * Stop playback.

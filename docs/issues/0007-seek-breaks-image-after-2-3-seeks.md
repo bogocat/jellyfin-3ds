@@ -1,6 +1,6 @@
 # Issue 7: Seek breaks video image after 2–3 seeks (audio keeps playing)
 
-> **File as:** serrattleballs / https://github.com/serrattleballs/jellyfin-3ds/issues/new
+> **FILED as https://github.com/bogocat/jellyfin-3ds/issues/7** (2026-06-11, with updated root-cause analysis: duplicate PlaySessionId on seek — fixed in PR #16 — plus missing transcode-job cleanup)
 > **Suggested title:** Seek breaks video image after 2–3 seeks (audio keeps playing)
 > **Suggested labels:** `area:video`, `bug`
 > **Hardware repro only** — needs real 3DS, not Citra (Citra networking is broken)

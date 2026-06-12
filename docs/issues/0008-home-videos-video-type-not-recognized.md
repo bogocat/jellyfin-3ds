@@ -1,6 +1,6 @@
 # Issue 8: "Home Videos and Photos" library — videos don't load (Type="Video" not recognized)
 
-> **File as:** serrattleballs / https://github.com/serrattleballs/jellyfin-3ds/issues/new
+> **FILED as https://github.com/bogocat/jellyfin-3ds/issues/8** (2026-06-11; Type=Video mapping shipped in PR #16, Photo handling still open. Note: the blanket IncludeItemTypes=Video idea below is wrong — it would filter Audio/folders out of every library)
 > **Suggested title:** Home Videos and Photos library: videos don't load (Type=Video not recognized)
 > **Suggested labels:** `area:api`, `bug`, `good first issue`
 > **Citra-reproducible** — library listing works, item type just maps to `JFIN_ITEM_UNKNOWN`

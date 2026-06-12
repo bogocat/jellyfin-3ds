@@ -2,13 +2,8 @@
 
 Native Jellyfin media client for Nintendo 3DS homebrew.
 
-## Git Identity
-
-This repo is published under the **serrattleballs** pseudonym. Always commit and push as serrattleballs — never use jakecelentano credentials.
-
-- Local git config is set: `user.name = serrattleballs`, `user.email = serrattleballs@users.noreply.github.com`
-- Remote uses SSH alias `github-rattleballs` with dedicated key `~/.ssh/serrattleballs`
-- Do NOT use `Co-Authored-By` footers in commits
+Repo lives at github.com/bogocat/jellyfin-3ds (the old serrattleballs
+pseudonym is retired). CI builds every PR via GitHub Actions.
 
 ## Build
 

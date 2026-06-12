@@ -64,6 +64,17 @@ static void format_ticks(int64_t ticks, char *out, int out_len)
     snprintf(out, out_len, "%d:%02d", min, sec);
 }
 
+/* Map Jellyfin's 3D metadata onto the video player's render mode.
+ * TAB formats aren't renderable in 3D yet — they play flat (2D). */
+static vp_3d_mode_t item_3d_mode(const jfin_item_t *item)
+{
+    switch (item->video_3d_format) {
+    case JFIN_3D_HSBS: return VP_3D_HSBS;
+    case JFIN_3D_FSBS: return VP_3D_FSBS;
+    default:           return VP_3D_NONE;
+    }
+}
+
 /* ── Selection style helper ────────────────────────────────────────── */
 
 static void draw_list_item_bg(float y, float w, float h, bool selected)
@@ -333,11 +344,12 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                 if (is_playable) {
                     if (is_video && video_player_is_supported()) {
                         /* Video playback on New 3DS */
-                        bool is_3d = (item->video_3d_format == JFIN_3D_HSBS);
+                        vp_3d_mode_t mode_3d = item_3d_mode(item);
                         audio_player_stop();
                         jfin_stream_t stream;
-                        if (jfin_get_video_stream(session, item->id, 0, is_3d, &stream) &&
-                            video_player_play(stream.url, item->runtime_ticks, 0, is_3d)) {
+                        if (jfin_get_video_stream(session, item->id, 0,
+                                                  mode_3d != VP_3D_NONE, &stream) &&
+                            video_player_play(stream.url, item->runtime_ticks, 0, mode_3d)) {
                             state->now_playing = *item;
                             state->has_now_playing = true;
                             state->playing_index = state->selected_index;
@@ -457,12 +469,13 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                     bool next_is_video = (next_item->type == JFIN_ITEM_MOVIE ||
                                           next_item->type == JFIN_ITEM_EPISODE);
                     if (next_playable) {
-                        bool next_is_3d = (next_item->video_3d_format == JFIN_3D_HSBS);
+                        vp_3d_mode_t next_mode = item_3d_mode(next_item);
                         jfin_stream_t stream;
                         bool started = false;
                         if (next_is_video && video_player_is_supported()) {
-                            if (jfin_get_video_stream(session, next_item->id, 0, next_is_3d, &stream) &&
-                                video_player_play(stream.url, next_item->runtime_ticks, 0, next_is_3d)) {
+                            if (jfin_get_video_stream(session, next_item->id, 0,
+                                                      next_mode != VP_3D_NONE, &stream) &&
+                                video_player_play(stream.url, next_item->runtime_ticks, 0, next_mode)) {
                                 started = true;
                             } else if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
                                 audio_player_play(stream.url, next_item->runtime_ticks, 0);
@@ -544,10 +557,11 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
 
                 jfin_stream_t stream;
                 if (vid_active) {
-                    bool is_3d = (state->now_playing.video_3d_format == JFIN_3D_HSBS);
+                    vp_3d_mode_t mode_3d = item_3d_mode(&state->now_playing);
                     video_player_stop();
-                    if (jfin_get_video_stream(session, state->now_playing.id, new_pos, is_3d, &stream))
-                        video_player_play(stream.url, state->now_playing.runtime_ticks, new_pos, is_3d);
+                    if (jfin_get_video_stream(session, state->now_playing.id, new_pos,
+                                              mode_3d != VP_3D_NONE, &stream))
+                        video_player_play(stream.url, state->now_playing.runtime_ticks, new_pos, mode_3d);
                 } else {
                     audio_player_stop();
                     if (jfin_get_audio_stream(session, state->now_playing.id, new_pos, &stream))
@@ -584,12 +598,13 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                         bool next_is_video = (next_item->type == JFIN_ITEM_MOVIE ||
                                               next_item->type == JFIN_ITEM_EPISODE);
                         if (next_playable) {
-                            bool next_is_3d = (next_item->video_3d_format == JFIN_3D_HSBS);
+                            vp_3d_mode_t next_mode = item_3d_mode(next_item);
                             jfin_stream_t stream;
                             bool started = false;
                             if (next_is_video && video_player_is_supported()) {
-                                if (jfin_get_video_stream(session, next_item->id, 0, next_is_3d, &stream) &&
-                                    video_player_play(stream.url, next_item->runtime_ticks, 0, next_is_3d)) {
+                                if (jfin_get_video_stream(session, next_item->id, 0,
+                                                          next_mode != VP_3D_NONE, &stream) &&
+                                    video_player_play(stream.url, next_item->runtime_ticks, 0, next_mode)) {
                                     started = true;
                                 } else if (jfin_get_audio_stream(session, next_item->id, 0, &stream)) {
                                     audio_player_play(stream.url, next_item->runtime_ticks, 0);
@@ -824,14 +839,15 @@ void ui_render_browse(const ui_state_t *state)
 
         draw_list_item_bg(y, 310, UI_LIST_ITEM_HEIGHT - 4, idx == state->selected_index);
 
-        /* Item name */
+        /* Item name (3D badge for stereoscopic content) */
+        const char *badge = (item->video_3d_format != JFIN_3D_NONE) ? " [3D]" : "";
         char label[160];
         if (item->type == JFIN_ITEM_AUDIO && item->index_number > 0) {
-            snprintf(label, sizeof(label), "%d. %s", item->index_number, item->name);
+            snprintf(label, sizeof(label), "%d. %s%s", item->index_number, item->name, badge);
         } else if (item->type == JFIN_ITEM_EPISODE && item->index_number > 0) {
-            snprintf(label, sizeof(label), "E%d - %s", item->index_number, item->name);
+            snprintf(label, sizeof(label), "E%d - %s%s", item->index_number, item->name, badge);
         } else {
-            snprintf(label, sizeof(label), "%s", item->name);
+            snprintf(label, sizeof(label), "%s%s", item->name, badge);
         }
 
         draw_text(15, y + 4, 0.5f, rgba(COLOR_TEXT_PRIMARY), label);
@@ -1101,10 +1117,12 @@ void ui_render_settings(const ui_state_t *state, const jfin_session_t *session)
 void ui_render(const ui_state_t *state, const jfin_session_t *session,
                const player_status_t *player)
 {
-    /* Enable stereoscopic 3D only during active 3D video playback */
+    /* Enable stereoscopic 3D only while a 3D frame is actually being
+     * drawn (PLAYING/PAUSED). During LOADING/ERROR the right framebuffer
+     * holds stale data and must not be displayed. */
     video_status_t vs_3d = video_player_get_status();
     gfxSet3D(state->current_view == VIEW_NOW_PLAYING && vs_3d.is_3d &&
-             vs_3d.state != VIDEO_STOPPED);
+             (vs_3d.state == VIDEO_PLAYING || vs_3d.state == VIDEO_PAUSED));
 
     C2D_TextBufClear(s_text_buf);
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);

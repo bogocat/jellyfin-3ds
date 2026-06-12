@@ -29,8 +29,9 @@ extern "C" {
 
 typedef enum {
     JFIN_3D_NONE = 0,
-    JFIN_3D_HSBS,  /* HalfSideBySide */
-    JFIN_3D_HTAB,  /* HalfTopAndBottom */
+    JFIN_3D_HSBS,  /* HalfSideBySide — each eye anamorphic half-width */
+    JFIN_3D_FSBS,  /* FullSideBySide — each eye at native aspect */
+    JFIN_3D_HTAB,  /* HalfTopAndBottom (not rendered in 3D yet) */
 } jfin_3d_format_t;
 
 typedef enum {

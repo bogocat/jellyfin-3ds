@@ -108,7 +108,8 @@ static struct {
     LightLock       tex_lock;
 
     /* Stereoscopic 3D (SBS) */
-    bool            is_3d;
+    bool            is_3d;             /* mode_3d != VP_3D_NONE */
+    vp_3d_mode_t    mode_3d;
     C3D_Tex         frame_tex_right[2]; /* right eye double-buffered (3D only) */
     C2D_Image       frame_img_right;
 
@@ -247,12 +248,15 @@ static double get_audio_clock(void)
 
 /* ── Network thread ────────────────────────────────────────────────── */
 
+static int64_t s_net_bytes_rx; /* net thread only — gates retry safety */
+
 static size_t net_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata)
 {
     demux_ctx_t *demux = (demux_ctx_t *)userdata;
     size_t total = size * nmemb;
 
     if (s_vp.stop_requested) return 0;
+    s_net_bytes_rx += (int64_t)total;
 
     size_t written = 0;
     while (written < total && !s_vp.stop_requested) {
@@ -318,6 +322,17 @@ static void net_thread_func(void *arg)
         /* Success or non-retryable: stop */
         if (res == CURLE_OK || res == CURLE_WRITE_ERROR /* stop_requested */)
             break;
+
+        /* A retry restarts the transfer from byte 0 (Jellyfin's transcode
+         * stream has no usable Range resume). If any bytes already reached
+         * the ring the demuxer has consumed part of the stream, and a
+         * restart would splice duplicate TS data into it — corruption.
+         * Only retry failures that happened before first byte. */
+        if (s_net_bytes_rx > 0) {
+            log_write("NET: mid-stream failure after %lld bytes — not retrying",
+                      (long long)s_net_bytes_rx);
+            break;
+        }
 
         /* Retryable: connection lost, timeout, recv error */
         if (res != CURLE_RECV_ERROR && res != CURLE_OPERATION_TIMEDOUT
@@ -869,16 +884,18 @@ void video_player_cleanup(void)
 }
 
 bool video_player_play(const char *url, int64_t duration_ticks,
-                       int64_t seek_offset_ticks, bool is_3d)
+                       int64_t seek_offset_ticks, vp_3d_mode_t mode_3d)
 {
     log_write("PLAY: starting video, url_len=%d seek=%lld 3d=%d",
-              (int)strlen(url), (long long)seek_offset_ticks, is_3d);
+              (int)strlen(url), (long long)seek_offset_ticks, (int)mode_3d);
     video_player_stop();
 
     snprintf(s_vp.url, sizeof(s_vp.url), "%s", url);
     s_vp.duration_ticks = duration_ticks;
     s_vp.seek_offset_ticks = seek_offset_ticks;
-    s_vp.is_3d = is_3d;
+    s_vp.mode_3d = mode_3d;
+    s_vp.is_3d = (mode_3d != VP_3D_NONE);
+    s_net_bytes_rx = 0;
     s_vp.position_ticks = seek_offset_ticks;
     s_vp.error_msg[0] = '\0';
     s_vp.stop_requested = false;
@@ -1007,6 +1024,7 @@ void video_player_stop(void)
     s_vp.frame_img.tex = NULL;
     s_vp.frame_img_right.tex = NULL;
     s_vp.is_3d = false;
+    s_vp.mode_3d = VP_3D_NONE;
 
     s_vp.state = VIDEO_STOPPED;
 }
@@ -1054,6 +1072,25 @@ video_status_t video_player_get_status(void)
     return st;
 }
 
+/**
+ * Per-eye draw placement for SBS content, fitted to the 400x240 top screen.
+ * HSBS eyes are anamorphic half-width, so they get a 2x horizontal stretch
+ * to restore aspect; FSBS eyes are already at native aspect (no stretch).
+ */
+static void compute_3d_draw_rect(float *x, float *y, float *sx, float *sy)
+{
+    float eye_stretch = (s_vp.mode_3d == VP_3D_HSBS) ? 2.0f : 1.0f;
+    float logical_w = s_vp.display_width * eye_stretch;
+    float logical_h = (float)s_vp.display_height;
+    float scale = 400.0f / logical_w;
+    if (logical_h * scale > 240.0f)
+        scale = 240.0f / logical_h;
+    *sx = eye_stretch * scale;
+    *sy = scale;
+    *x = (400.0f - s_vp.display_width * (*sx)) / 2.0f;
+    *y = (240.0f - s_vp.display_height * (*sy)) / 2.0f;
+}
+
 void video_player_render_frame(void)
 {
     static int render_log_count = 0;
@@ -1087,18 +1124,8 @@ void video_player_render_frame(void)
     /* Draw the frame texture on the top screen */
     if (s_vp.tex_initialized && s_vp.frame_img.tex) {
         if (s_vp.is_3d) {
-            /* HalfSBS: stretch 2x horizontally to restore AR, then fit screen */
-            float logical_w = s_vp.display_width * 2.0f;
-            float logical_h = (float)s_vp.display_height;
-            float scale = 400.0f / logical_w;
-            if (logical_h * scale > 240.0f)
-                scale = 240.0f / logical_h;
-            float sx = 2.0f * scale;
-            float sy = scale;
-            float rw = s_vp.display_width * sx;
-            float rh = s_vp.display_height * sy;
-            float x = (400.0f - rw) / 2.0f;
-            float y = (240.0f - rh) / 2.0f;
+            float x, y, sx, sy;
+            compute_3d_draw_rect(&x, &y, &sx, &sy);
             C2D_DrawImageAt(s_vp.frame_img, x, y, 0.5f, NULL, sx, sy);
         } else {
             float x = (400 - s_vp.display_width) / 2.0f;
@@ -1114,17 +1141,7 @@ void video_player_render_frame_right(void)
     if (s_vp.state != VIDEO_PLAYING && s_vp.state != VIDEO_PAUSED) return;
     if (!s_vp.tex_initialized || !s_vp.frame_img_right.tex) return;
 
-    /* Same scaling as left eye */
-    float logical_w = s_vp.display_width * 2.0f;
-    float logical_h = (float)s_vp.display_height;
-    float scale = 400.0f / logical_w;
-    if (logical_h * scale > 240.0f)
-        scale = 240.0f / logical_h;
-    float sx = 2.0f * scale;
-    float sy = scale;
-    float rw = s_vp.display_width * sx;
-    float rh = s_vp.display_height * sy;
-    float x = (400.0f - rw) / 2.0f;
-    float y = (240.0f - rh) / 2.0f;
+    float x, y, sx, sy;
+    compute_3d_draw_rect(&x, &y, &sx, &sy);
     C2D_DrawImageAt(s_vp.frame_img_right, x, y, 0.5f, NULL, sx, sy);
 }
