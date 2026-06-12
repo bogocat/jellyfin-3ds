@@ -179,7 +179,7 @@ static void net_thread_func(void *arg)
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 32768L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/0.1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/" JFIN_VERSION);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
     CURLcode res = curl_easy_perform(curl);
