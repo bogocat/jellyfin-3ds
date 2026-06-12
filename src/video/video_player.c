@@ -351,6 +351,7 @@ static bool init_audio_decoder(demux_ctx_t *demux)
     int open_ret = avcodec_open2(s_vp.audio_dec_ctx, codec, NULL);
     if (open_ret < 0) {
         log_write("AUDIO: avcodec_open2 FAILED ret=%d", open_ret);
+        avcodec_free_context(&s_vp.audio_dec_ctx);
         return false;
     }
     log_write("AUDIO: decoder opened (swr deferred to first frame)");
@@ -415,6 +416,7 @@ static void decode_audio_packet(AVPacket *pkt)
             if (swr_init(s_vp.swr_ctx) < 0) {
                 log_write("AUDIO: swr_init FAILED (deferred) fmt=%d rate=%d ch=%d",
                           frame->format, in_rate, frame->channels);
+                swr_free(&s_vp.swr_ctx);
                 break;
             }
 
@@ -428,12 +430,13 @@ static void decode_audio_packet(AVPacket *pkt)
         /* Find a free NDSP buffer */
         ndspWaveBuf *wbuf = &s_vp.wave_bufs[s_vp.audio_buf_idx];
 
-        /* Wait for buffer to be free */
-        int waited = 0;
+        /* Wait for buffer to be free. No timeout here: while paused this
+         * legitimately takes arbitrarily long, and proceeding anyway would
+         * resubmit a buffer NDSP still owns (queue corruption). Stop breaks
+         * the wait. */
         while ((wbuf->status == NDSP_WBUF_QUEUED || wbuf->status == NDSP_WBUF_PLAYING)
-               && !s_vp.stop_requested && waited < 1000) {
+               && !s_vp.stop_requested) {
             svcSleepThread(1000000LL);
-            waited++;
         }
         if (s_vp.stop_requested) break;
 
@@ -582,7 +585,9 @@ static void decode_thread_func(void *arg)
         LightLock_Unlock(&s_vp.state_lock);
     }
 
-    fq_cleanup(&s_vp.fq);
+    /* Frame queue is freed in video_player_stop() after the convert
+     * thread is joined — freeing it here would yank buffers out from
+     * under a convert thread that is still tiling a popped frame. */
 }
 
 /* ── Convert thread (Morton tiling + A/V sync) ─────────────────────── */
@@ -622,9 +627,15 @@ static void convert_thread_func(void *arg)
         queued_frame_t *f = fq_pop(&s_vp.fq);
         if (!f || !f->data) continue;
 
-        /* Morton tiling into the write texture */
+        /* Morton tiling into the write texture.
+         * tex_initialized is published with release semantics after the
+         * main thread finishes init_frame_texture(); acquire here makes
+         * the texture/index/table writes visible. After that point
+         * tex_write_idx is only ever modified by this thread. */
+        if (!__atomic_load_n(&s_vp.tex_initialized, __ATOMIC_ACQUIRE))
+            continue;
         int write_idx = s_vp.tex_write_idx;
-        if (s_vp.tex_initialized && s_vp.frame_tex[write_idx].data) {
+        if (s_vp.frame_tex[write_idx].data) {
             u8 *tex_data = (u8 *)s_vp.frame_tex[write_idx].data;
             int tex_w = s_vp.frame_tex[write_idx].width;
 
@@ -683,12 +694,18 @@ static void init_frame_texture(int width, int height)
 
     s_vp.tex_write_idx = 0;
     s_vp.tex_display_idx = 1;
-    s_vp.tex_initialized = true;
-    LightLock_Init(&s_vp.tex_lock);
 
-    /* Build offset tables for Morton tiling */
+    /* Build offset tables for Morton tiling — must happen before
+     * tex_initialized is published or the convert thread can tile
+     * with all-zero offset tables. */
     if (!s_inc_tables_built)
         build_offset_tables(tex_w, tex_h);
+
+    /* tex_lock is initialized once in video_player_init(); re-initializing
+     * it here could corrupt a lock the convert thread already holds.
+     * Publish tex_initialized last (release) — the convert thread gates on
+     * it (acquire) before touching any of the state set up above. */
+    __atomic_store_n(&s_vp.tex_initialized, true, __ATOMIC_RELEASE);
 
     log_write("TEX: init OK %dx%d in %dx%d tex (double buffered)", width, height, tex_w, tex_h);
 }
@@ -765,7 +782,10 @@ bool video_player_play(const char *url, int64_t duration_ticks, int64_t seek_off
     s_vp.demux.ring_fill = 0;
     s_vp.demux.ring_finished = false;
 
-    /* Reset NDSP channel */
+    /* Reset NDSP channel. Set the channel field now rather than in
+     * init_audio_decoder so a stop() before audio init doesn't clear
+     * channel 0 (the music player's channel). */
+    s_vp.ndsp_channel = 1;
     ndspChnReset(1);
 
     /* Launch threads (-1 = any available core) */
@@ -807,7 +827,9 @@ bool video_player_play(const char *url, int64_t duration_ticks, int64_t seek_off
 
 void video_player_stop(void)
 {
-    if (s_vp.state == VIDEO_STOPPED && !s_vp.net_thread)
+    /* Guard on thread handles, not state: the decode thread sets
+     * VIDEO_STOPPED at EOF while all three threads are still live. */
+    if (!s_vp.net_thread && !s_vp.decode_thread && !s_vp.convert_thread)
         return;
 
     s_vp.stop_requested = true;
@@ -827,6 +849,9 @@ void video_player_stop(void)
         threadFree(s_vp.convert_thread);
         s_vp.convert_thread = NULL;
     }
+
+    /* All threads joined — now it is safe to free the frame queue */
+    fq_cleanup(&s_vp.fq);
 
     ndspChnWaveBufClear(s_vp.ndsp_channel);
 
@@ -859,6 +884,8 @@ void video_player_stop(void)
         C3D_TexDelete(&s_vp.frame_tex[1]);
         s_vp.tex_initialized = false;
     }
+    /* Don't let the next playback render a frame from the previous video */
+    s_vp.frame_img.tex = NULL;
 
     s_vp.state = VIDEO_STOPPED;
 }
