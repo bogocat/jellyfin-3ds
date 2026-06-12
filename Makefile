@@ -39,7 +39,14 @@ CFLAGS	:=	-g -Wall -O2 -mword-relocations \
 			-ffunction-sections \
 			$(ARCH)
 
-CFLAGS	+=	$(INCLUDE) -D__3DS__ -DJFIN_VERSION=\"1.0.0\"
+# Version is derived from git tags so the binary, UI header, MediaBrowser
+# auth header, and releases can never drift apart. Tagged commit -> "1.1.0";
+# between tags -> "1.0.1-8-gabc1234"; dirty tree gets "-dirty"; no git/tags
+# (tarball build) -> "unknown". Override with: make JFIN_VERSION=x.y.z
+GIT_DESC := $(shell git describe --tags --always --dirty 2>/dev/null)
+JFIN_VERSION ?= $(if $(GIT_DESC),$(patsubst v%,%,$(GIT_DESC)),unknown)
+
+CFLAGS	+=	$(INCLUDE) -D__3DS__ -DJFIN_VERSION=\"$(JFIN_VERSION)\"
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 

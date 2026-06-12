@@ -299,7 +299,7 @@ static void net_thread_func(void *arg)
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_BUFFERSIZE, 65536L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/1.0.1");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "Jellyfin-3DS/" JFIN_VERSION);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L); /* server may need time to start transcoding */
 
     /* Retry on transient network failures (WiFi drops, peer resets) */

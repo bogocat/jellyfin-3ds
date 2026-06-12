@@ -15,12 +15,24 @@ jobs:
     container: devkitpro/devkitarm:20260610
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for git-describe versioning
 
       - name: Install 3DS portlibs
         run: |
           dkp-pacman -S --noconfirm --needed \
             3ds-curl 3ds-mbedtls 3ds-zlib 3ds-mpg123 \
             3ds-libopus 3ds-opusfile 3ds-libvorbisidec 3ds-libogg
+
+      # The workspace is checked out by the runner uid but make runs as the
+      # container's root; without this, git describe fails (dubious
+      # ownership) and the binary silently bakes version "unknown".
+      - name: Trust workspace for git describe
+        run: |
+          command -v git >/dev/null || { apt-get update -qq || true; apt-get install -y -qq git; }
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "version will be: $(git describe --tags --always --dirty)"
+          git describe --tags --exact-match   # tag builds must be exactly on the tag
 
       # Same cache key as build.yml — tag builds reuse the FFmpeg libs
       # already built on main (caches on the default branch are visible
@@ -41,16 +53,8 @@ jobs:
       - name: Build .3dsx
         run: make -j"$(nproc)"
 
-      - name: Version sanity check
-        run: |
-          # The tag should match the version baked into the binary
-          # (JFIN_VERSION in the Makefile). Warn loudly on mismatch but
-          # don't fail the release — the asset is still usable.
-          tag="${GITHUB_REF_NAME#v}"
-          baked=$(grep -oP 'JFIN_VERSION=\\"\K[0-9.]+' Makefile || true)
-          if [ "$tag" != "$baked" ]; then
-            echo "::warning::Tag v$tag but Makefile bakes JFIN_VERSION=\"$baked\" — bump the Makefile before tagging next time"
-          fi
+      # No version sanity check needed anymore: JFIN_VERSION is derived
+      # from git describe at build time, so a tag build bakes the tag.
 
       - name: Stage versioned asset
         run: cp jellyfin-3ds.3dsx "jellyfin-3ds-${GITHUB_REF_NAME}.3dsx"
