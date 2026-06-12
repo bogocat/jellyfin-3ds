@@ -8,12 +8,15 @@
 # Or from host:
 #   ./lib/ffmpeg/build-ffmpeg.sh docker
 #
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 FFMPEG_SRC="/tmp/ffmpeg-build/src"
 FFMPEG_PREFIX="/tmp/ffmpeg-build/install"
+# Pinned commit of the ThirdTube FFmpeg fork. The CI cache key hashes this
+# script, so bumping the pin automatically invalidates cached .a files.
+FFMPEG_PIN="306994b887d484eb9e0a9aa95b8d7825ce4efec1"
 
 # If "docker" argument, re-run inside container
 if [ "$1" = "docker" ]; then
@@ -36,16 +39,19 @@ echo "=== FFmpeg Cross-Compile for 3DS ==="
 echo "DEVKITARM: $DEVKITARM"
 echo "DEVKITPRO: $DEVKITPRO"
 
-# Install build deps (python3 is needed for the configure patch below)
-apt-get update -qq && apt-get install -y -qq git texinfo python3 2>/dev/null || true
+# Install build deps (python3 is needed for the configure patch below).
+# update may fail transiently (stale mirrors) — install failing is fatal.
+apt-get update -qq || true
+apt-get install -y -qq git texinfo python3
 
-# Clone FFmpeg (ThirdTube's fork has the pthreads patch)
+# Clone FFmpeg (ThirdTube's fork has the pthreads patch) at the pinned commit
 if [ ! -d "$FFMPEG_SRC" ]; then
-    echo "=== Cloning FFmpeg ==="
-    git clone --depth 1 https://github.com/windows-server-2003/FFmpeg.git "$FFMPEG_SRC"
+    echo "=== Cloning FFmpeg (pin $FFMPEG_PIN) ==="
+    git clone https://github.com/windows-server-2003/FFmpeg.git "$FFMPEG_SRC"
 fi
 
 cd "$FFMPEG_SRC"
+git checkout --quiet "$FFMPEG_PIN"
 
 # Clean any previous failed build
 make distclean 2>/dev/null || true
