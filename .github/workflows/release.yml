@@ -1,0 +1,62 @@
+name: release
+
+# Pushing a v* tag builds the .3dsx and attaches it to a GitHub release.
+#   git tag v1.1.0 && git push origin v1.1.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create the release + upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:20260610
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install 3DS portlibs
+        run: |
+          dkp-pacman -S --noconfirm --needed \
+            3ds-curl 3ds-mbedtls 3ds-zlib 3ds-mpg123 \
+            3ds-libopus 3ds-opusfile 3ds-libvorbisidec 3ds-libogg
+
+      # Same cache key as build.yml — tag builds reuse the FFmpeg libs
+      # already built on main (caches on the default branch are visible
+      # to tag refs). Falls back to a full build on miss.
+      - name: Cache FFmpeg static libs
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/ffmpeg/*.a
+            lib/ffmpeg/include
+          key: ffmpeg-3ds-${{ hashFiles('lib/ffmpeg/build-ffmpeg.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: bash lib/ffmpeg/build-ffmpeg.sh
+
+      - name: Build .3dsx
+        run: make -j"$(nproc)"
+
+      - name: Version sanity check
+        run: |
+          # The tag should match the version baked into the binary
+          # (JFIN_VERSION in the Makefile). Warn loudly on mismatch but
+          # don't fail the release — the asset is still usable.
+          tag="${GITHUB_REF_NAME#v}"
+          baked=$(grep -oP 'JFIN_VERSION=\\"\K[0-9.]+' Makefile || true)
+          if [ "$tag" != "$baked" ]; then
+            echo "::warning::Tag v$tag but Makefile bakes JFIN_VERSION=\"$baked\" — bump the Makefile before tagging next time"
+          fi
+
+      - name: Stage versioned asset
+        run: cp jellyfin-3ds.3dsx "jellyfin-3ds-${GITHUB_REF_NAME}.3dsx"
+
+      - name: Create release with asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: jellyfin-3ds-${{ github.ref_name }}.3dsx
+          generate_release_notes: true
