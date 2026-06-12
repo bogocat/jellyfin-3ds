@@ -54,17 +54,21 @@ static void ring_free(ring_buffer_t *rb)
     }
 }
 
+/* fill and finished are read by the decode thread outside the lock
+ * (prefetch/EOF checks), so they are updated with atomics — same
+ * pattern as the video player's ring_fill fix. */
+
 static int ring_write(ring_buffer_t *rb, const u8 *data, int len)
 {
     LightLock_Lock(&rb->lock);
-    int space = RING_SIZE - rb->fill;
+    int space = RING_SIZE - __atomic_load_n(&rb->fill, __ATOMIC_ACQUIRE);
     if (len > space) len = space;
 
     for (int i = 0; i < len; i++) {
         rb->data[rb->write_pos] = data[i];
         rb->write_pos = (rb->write_pos + 1) % RING_SIZE;
     }
-    rb->fill += len;
+    __atomic_fetch_add(&rb->fill, len, __ATOMIC_RELEASE);
     LightLock_Unlock(&rb->lock);
     return len;
 }
@@ -72,15 +76,26 @@ static int ring_write(ring_buffer_t *rb, const u8 *data, int len)
 static int ring_read(ring_buffer_t *rb, u8 *data, int len)
 {
     LightLock_Lock(&rb->lock);
-    if (len > rb->fill) len = rb->fill;
+    int avail = __atomic_load_n(&rb->fill, __ATOMIC_ACQUIRE);
+    if (len > avail) len = avail;
 
     for (int i = 0; i < len; i++) {
         data[i] = rb->data[rb->read_pos];
         rb->read_pos = (rb->read_pos + 1) % RING_SIZE;
     }
-    rb->fill -= len;
+    __atomic_fetch_sub(&rb->fill, len, __ATOMIC_RELEASE);
     LightLock_Unlock(&rb->lock);
     return len;
+}
+
+static int ring_fill_level(const ring_buffer_t *rb)
+{
+    return __atomic_load_n(&rb->fill, __ATOMIC_ACQUIRE);
+}
+
+static bool ring_is_finished(const ring_buffer_t *rb)
+{
+    return __atomic_load_n(&rb->finished, __ATOMIC_ACQUIRE);
 }
 
 /* ── Player state ──────────────────────────────────────────────────── */
@@ -171,7 +186,9 @@ static void net_thread_func(void *arg)
         s_player.state = PLAYER_ERROR;
     }
 
-    s_player.ring.finished = true;
+    /* Release store: the decode thread must see all ring_write()s
+     * before it sees finished=true, or it can exit with data unplayed */
+    __atomic_store_n(&s_player.ring.finished, true, __ATOMIC_RELEASE);
     curl_easy_cleanup(curl);
 }
 
@@ -216,7 +233,8 @@ static void decode_thread_func(void *arg)
 
     /* Wait for initial buffer fill before starting playback */
     while (!s_player.stop_requested) {
-        if (s_player.ring.fill >= (int)AUDIO_PREFETCH_BYTES || s_player.ring.finished)
+        if (ring_fill_level(&s_player.ring) >= (int)AUDIO_PREFETCH_BYTES ||
+            ring_is_finished(&s_player.ring))
             break;
         svcSleepThread(10000000LL); /* 10ms */
     }
@@ -239,7 +257,7 @@ static void decode_thread_func(void *arg)
             ndspChnSetRate(s_player.ndsp_channel, (float)rate);
             break;
         }
-        if (s_player.ring.finished && s_player.ring.fill == 0)
+        if (ring_is_finished(&s_player.ring) && ring_fill_level(&s_player.ring) == 0)
             break;
         svcSleepThread(5000000LL); /* 5ms */
     }
@@ -263,7 +281,7 @@ static void decode_thread_func(void *arg)
                                       AUDIO_BUFFER_SAMPLES);
 
         if (samples <= 0) {
-            if (s_player.ring.finished && s_player.ring.fill == 0)
+            if (ring_is_finished(&s_player.ring) && ring_fill_level(&s_player.ring) == 0)
                 break; /* end of stream */
             svcSleepThread(4000000LL);
             continue;
@@ -389,6 +407,21 @@ bool audio_player_play(const char *url, int64_t duration_ticks, int64_t seek_off
 
     if (!s_player.net_thread || !s_player.decode_thread) {
         snprintf(s_player.error_msg, sizeof(s_player.error_msg), "Thread creation failed");
+        /* Wind down whichever thread DID start and free the ring buffer,
+         * otherwise a lone net thread keeps streaming into a ring nobody
+         * drains and the 512KB ring leaks on every failed play. */
+        s_player.stop_requested = true;
+        if (s_player.net_thread) {
+            threadJoin(s_player.net_thread, U64_MAX);
+            threadFree(s_player.net_thread);
+            s_player.net_thread = NULL;
+        }
+        if (s_player.decode_thread) {
+            threadJoin(s_player.decode_thread, U64_MAX);
+            threadFree(s_player.decode_thread);
+            s_player.decode_thread = NULL;
+        }
+        ring_free(&s_player.ring);
         s_player.state = PLAYER_ERROR;
         return false;
     }
@@ -451,7 +484,7 @@ player_status_t audio_player_get_status(void)
     status.position_ticks = s_player.position_ticks;
     status.duration_ticks = s_player.duration_ticks;
     status.buffer_percent = (s_player.ring.data && RING_SIZE > 0)
-        ? (s_player.ring.fill * 100 / RING_SIZE) : 0;
+        ? (ring_fill_level(&s_player.ring) * 100 / RING_SIZE) : 0;
     snprintf(status.error_msg, sizeof(status.error_msg), "%s", s_player.error_msg);
     LightLock_Unlock(&s_player.state_lock);
     return status;
