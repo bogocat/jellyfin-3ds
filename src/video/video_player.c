@@ -882,7 +882,9 @@ void video_player_stop(void)
     if (s_vp.tex_initialized) {
         C3D_TexDelete(&s_vp.frame_tex[0]);
         C3D_TexDelete(&s_vp.frame_tex[1]);
-        s_vp.tex_initialized = false;
+        /* RELAXED is sufficient (convert thread already joined) but keep
+         * every cross-thread write to tex_initialized atomic for consistency */
+        __atomic_store_n(&s_vp.tex_initialized, false, __ATOMIC_RELAXED);
     }
     /* Don't let the next playback render a frame from the previous video */
     s_vp.frame_img.tex = NULL;
