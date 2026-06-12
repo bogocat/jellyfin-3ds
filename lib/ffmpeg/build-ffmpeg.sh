@@ -36,8 +36,8 @@ echo "=== FFmpeg Cross-Compile for 3DS ==="
 echo "DEVKITARM: $DEVKITARM"
 echo "DEVKITPRO: $DEVKITPRO"
 
-# Install build deps
-apt-get update -qq && apt-get install -y -qq git texinfo 2>/dev/null || true
+# Install build deps (python3 is needed for the configure patch below)
+apt-get update -qq && apt-get install -y -qq git texinfo python3 2>/dev/null || true
 
 # Clone FFmpeg (ThirdTube's fork has the pthreads patch)
 if [ ! -d "$FFMPEG_SRC" ]; then
@@ -203,7 +203,9 @@ make -j$(nproc) 2>&1 | tail -20
 make install 2>&1 | tail -10
 
 echo "=== Copying results ==="
-DEST="/src/jellyfin-3ds/lib/ffmpeg"
+# Copy back to wherever this script lives (works in the local Docker
+# mount at /src/jellyfin-3ds and in CI checkouts alike)
+DEST="$SCRIPT_DIR"
 cp -r "$FFMPEG_PREFIX/lib/"*.a "$DEST/"
 cp -r "$FFMPEG_PREFIX/include/" "$DEST/include/"
 
