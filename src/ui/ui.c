@@ -1118,11 +1118,14 @@ void ui_render(const ui_state_t *state, const jfin_session_t *session,
                const player_status_t *player)
 {
     /* Enable stereoscopic 3D only while a 3D frame is actually being
-     * drawn (PLAYING/PAUSED). During LOADING/ERROR the right framebuffer
-     * holds stale data and must not be displayed. */
+     * drawn (PLAYING/PAUSED) AND the slider is up. The right-eye render
+     * is slider-gated, so without the slider term here a slider at 0
+     * would present a stale right framebuffer; with it, slider 0 falls
+     * back to clean 2D (left eye full-res) per the design doc. */
     video_status_t vs_3d = video_player_get_status();
     gfxSet3D(state->current_view == VIEW_NOW_PLAYING && vs_3d.is_3d &&
-             (vs_3d.state == VIDEO_PLAYING || vs_3d.state == VIDEO_PAUSED));
+             (vs_3d.state == VIDEO_PLAYING || vs_3d.state == VIDEO_PAUSED) &&
+             osGet3DSliderState() > 0.0f);
 
     C2D_TextBufClear(s_text_buf);
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);

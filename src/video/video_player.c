@@ -341,8 +341,12 @@ static void net_thread_func(void *arg)
     }
 
     if (res != CURLE_OK && res != CURLE_WRITE_ERROR && !s_vp.stop_requested) {
-        snprintf(s_vp.error_msg, sizeof(s_vp.error_msg),
-                 "Network error: %s", curl_easy_strerror(res));
+        if (http_code > 0)
+            snprintf(s_vp.error_msg, sizeof(s_vp.error_msg),
+                     "HTTP %ld: %s", http_code, curl_easy_strerror(res));
+        else
+            snprintf(s_vp.error_msg, sizeof(s_vp.error_msg),
+                     "Network error: %s", curl_easy_strerror(res));
         s_vp.state = VIDEO_ERROR;
     }
 
