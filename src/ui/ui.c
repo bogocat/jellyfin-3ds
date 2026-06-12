@@ -166,19 +166,38 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
 
     case VIEW_LIBRARIES:
     case VIEW_BROWSE:
-        /* D-pad navigation */
-        if (kdown & KEY_DUP) {
-            if (state->selected_index > 0) {
-                state->selected_index--;
-                if (state->selected_index < state->scroll_offset)
-                    state->scroll_offset = state->selected_index;
+        /* D-pad navigation with hold-to-repeat: ~270ms initial delay,
+         * then one step every other frame (~15 items/s at 30fps). */
+        {
+            static int dpad_repeat_frames = 0;
+            bool nav_up = (kdown & KEY_DUP) != 0;
+            bool nav_down = (kdown & KEY_DDOWN) != 0;
+
+            if (nav_up || nav_down) {
+                dpad_repeat_frames = 0; /* fresh press resets the timer */
+            } else if (kheld & (KEY_DUP | KEY_DDOWN)) {
+                dpad_repeat_frames++;
+                if (dpad_repeat_frames >= 8 && (dpad_repeat_frames % 2) == 0) {
+                    nav_up = (kheld & KEY_DUP) != 0;
+                    nav_down = (kheld & KEY_DDOWN) != 0;
+                }
+            } else {
+                dpad_repeat_frames = 0;
             }
-        }
-        if (kdown & KEY_DDOWN) {
-            if (state->selected_index < state->items.count - 1) {
-                state->selected_index++;
-                if (state->selected_index >= state->scroll_offset + UI_MAX_VISIBLE_ITEMS)
-                    state->scroll_offset = state->selected_index - UI_MAX_VISIBLE_ITEMS + 1;
+
+            if (nav_up) {
+                if (state->selected_index > 0) {
+                    state->selected_index--;
+                    if (state->selected_index < state->scroll_offset)
+                        state->scroll_offset = state->selected_index;
+                }
+            }
+            if (nav_down) {
+                if (state->selected_index < state->items.count - 1) {
+                    state->selected_index++;
+                    if (state->selected_index >= state->scroll_offset + UI_MAX_VISIBLE_ITEMS)
+                        state->scroll_offset = state->selected_index - UI_MAX_VISIBLE_ITEMS + 1;
+                }
             }
         }
         /* Touch: drag to scroll, tap to select+activate */
