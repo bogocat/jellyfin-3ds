@@ -151,11 +151,14 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
             C3D_FrameEnd(0);
 
             jfin_session_t *s = (jfin_session_t *)session; /* cast away const for login */
-            if (jfin_login(s, state->server_url, state->username, state->password)) {
+            if (jfin_login(s, state->server_url, state->username, state->password,
+                           g_config.device_id)) {
                 /* Save credentials immediately so they persist even on crash */
                 config_save_session(&g_config, s->server_url,
                                     s->access_token, s->user_id,
                                     state->username);
+                /* Token obtained — no reason to keep the password in RAM */
+                memset(state->password, 0, sizeof(state->password));
                 state->current_view = VIEW_LIBRARIES;
                 jfin_get_views(session, &state->items);
                 state->selected_index = 0;

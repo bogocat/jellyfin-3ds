@@ -94,10 +94,13 @@ void jfin_cleanup(void);
 
 /**
  * Authenticate with username and password.
+ * device_id is the persistent per-console id (config); pass NULL/empty
+ * to fall back to the legacy fixed id.
  * On success, session is populated and session->authenticated == true.
  */
 bool jfin_login(jfin_session_t *session, const char *server_url,
-                const char *username, const char *password);
+                const char *username, const char *password,
+                const char *device_id);
 
 /**
  * Start QuickConnect flow. Returns a code the user enters in the web UI.

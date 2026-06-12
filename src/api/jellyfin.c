@@ -234,6 +234,8 @@ static jfin_item_type_t parse_item_type(const char *type_str)
     if (strcmp(type_str, "MusicArtist") == 0) return JFIN_ITEM_MUSIC_ARTIST;
     if (strcmp(type_str, "Audio") == 0) return JFIN_ITEM_AUDIO;
     if (strcmp(type_str, "Movie") == 0) return JFIN_ITEM_MOVIE;
+    /* "Home Videos and Photos" libraries return the generic Video type */
+    if (strcmp(type_str, "Video") == 0) return JFIN_ITEM_MOVIE;
     if (strcmp(type_str, "Series") == 0) return JFIN_ITEM_SERIES;
     if (strcmp(type_str, "Season") == 0) return JFIN_ITEM_SEASON;
     if (strcmp(type_str, "Episode") == 0) return JFIN_ITEM_EPISODE;
@@ -321,11 +323,15 @@ void jfin_cleanup(void)
 }
 
 bool jfin_login(jfin_session_t *session, const char *server_url,
-                const char *username, const char *password)
+                const char *username, const char *password,
+                const char *device_id)
 {
     memset(session, 0, sizeof(*session));
     snprintf(session->server_url, sizeof(session->server_url), "%s", server_url);
-    snprintf(session->device_id, sizeof(session->device_id), "%s", "3ds-jellyfin-001");
+    /* Use the persistent per-console device id so the token is bound to
+     * the same DeviceId that restored sessions (main.c) present later */
+    snprintf(session->device_id, sizeof(session->device_id), "%s",
+             (device_id && device_id[0]) ? device_id : "3ds-jellyfin-001");
 
     /* Remove trailing slash */
     int len = strlen(session->server_url);
@@ -341,6 +347,7 @@ bool jfin_login(jfin_session_t *session, const char *server_url,
     cJSON_AddStringToObject(body, "Pw", password);
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
+    if (!body_str) return false; /* OOM — don't POST an empty body */
 
     cJSON *resp = api_post(session, url, body_str);
     free(body_str);
@@ -537,13 +544,14 @@ bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
              session->device_id, item_id,
              (unsigned long)(tick & 0xFFFFFFFF), session->access_token);
 
-    if (start_ticks > 0 && len < (int)sizeof(out->url) - 80) {
-        /* Cache-buster: Jellyfin caches transcodes per item+device.
-         * A unique PlaySessionId forces a fresh transcode on seek. */
-        u64 tick = svcGetSystemTick();
-        int added = snprintf(out->url + len, sizeof(out->url) - len,
-                 "&StartTimeTicks=%lld&PlaySessionId=3ds%08lx",
-                 (long long)start_ticks, (unsigned long)(tick & 0xFFFFFFFF));
+    if (start_ticks > 0 && len > 0 && len < (int)sizeof(out->url) - 40) {
+        /* The base URL above already carries a PlaySessionId that is
+         * unique per call (fresh tick), which is what busts Jellyfin's
+         * per-item+device transcode cache on seek. Appending a second
+         * PlaySessionId here (the old behavior) sent two different
+         * session ids in one request. */
+        snprintf(out->url + len, sizeof(out->url) - len,
+                 "&StartTimeTicks=%lld", (long long)start_ticks);
         log_write("SEEK: StartTimeTicks=%lld session=3ds%08lx",
                   (long long)start_ticks, (unsigned long)(tick & 0xFFFFFFFF));
     }
@@ -578,6 +586,7 @@ bool jfin_report_start(const jfin_session_t *session, const char *item_id)
     cJSON_AddStringToObject(body, "ItemId", item_id);
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
+    if (!body_str) return true; /* OOM — skip rather than POST empty body */
 
     cJSON *resp = api_post(session, url, body_str);
     free(body_str);
@@ -598,6 +607,7 @@ bool jfin_report_progress(const jfin_session_t *session, const char *item_id,
     cJSON_AddBoolToObject(body, "IsPaused", is_paused);
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
+    if (!body_str) return true; /* OOM — skip rather than POST empty body */
 
     cJSON *resp = api_post(session, url, body_str);
     free(body_str);
@@ -617,6 +627,7 @@ bool jfin_report_stop(const jfin_session_t *session, const char *item_id,
     cJSON_AddNumberToObject(body, "PositionTicks", (double)position_ticks);
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
+    if (!body_str) return true; /* OOM — skip rather than POST empty body */
 
     cJSON *resp = api_post(session, url, body_str);
     free(body_str);
