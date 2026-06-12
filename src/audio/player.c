@@ -88,12 +88,16 @@ static int ring_read(ring_buffer_t *rb, u8 *data, int len)
     return len;
 }
 
-static int ring_fill_level(const ring_buffer_t *rb)
+/* NOTE: fill/finished must ONLY be accessed through atomics (or these
+ * helpers) once threads are running — mixing in plain reads/writes is a
+ * C11 data race. ACQUIRE is needed in the decode-thread spin loops; for
+ * pure UI snapshots a RELAXED load suffices (see audio_player_get_status). */
+static inline int ring_fill_level(const ring_buffer_t *rb)
 {
     return __atomic_load_n(&rb->fill, __ATOMIC_ACQUIRE);
 }
 
-static bool ring_is_finished(const ring_buffer_t *rb)
+static inline bool ring_is_finished(const ring_buffer_t *rb)
 {
     return __atomic_load_n(&rb->finished, __ATOMIC_ACQUIRE);
 }
@@ -483,8 +487,10 @@ player_status_t audio_player_get_status(void)
     status.state = s_player.state;
     status.position_ticks = s_player.position_ticks;
     status.duration_ticks = s_player.duration_ticks;
+    /* RELAXED: UI status snapshot, nothing is gated on this read
+     * (matches video_player_get_status) */
     status.buffer_percent = (s_player.ring.data && RING_SIZE > 0)
-        ? (ring_fill_level(&s_player.ring) * 100 / RING_SIZE) : 0;
+        ? (__atomic_load_n(&s_player.ring.fill, __ATOMIC_RELAXED) * 100 / RING_SIZE) : 0;
     snprintf(status.error_msg, sizeof(status.error_msg), "%s", s_player.error_msg);
     LightLock_Unlock(&s_player.state_lock);
     return status;
