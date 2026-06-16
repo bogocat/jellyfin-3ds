@@ -44,6 +44,9 @@ void cache_index_add(const char *item_id, const char *ext);
 /** Delete an item's cache file and drop it from the index. */
 bool cache_remove(const char *item_id, const char *ext);
 
+/** True if the in-memory index is at capacity (no more items can be added). */
+bool cache_is_full(void);
+
 /** Total bytes of all files in the cache dir (walks the dir — not per-frame). */
 uint64_t cache_total_bytes(void);
 

@@ -220,6 +220,24 @@ static void ui_download_item(const jfin_session_t *session,
                              const jfin_item_t *item)
 {
     const char *ext = item_cache_ext(item);
+
+    /* If the index is full, a completed download would be renamed on disk
+     * but never registered, so cache_has() stays false and the next X-press
+     * would delete the good file. Refuse up front with a visible message. */
+    if (cache_is_full()) {
+        C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+        C2D_TextBufClear(s_text_buf);
+        C2D_TargetClear(s_bottom, rgba(COLOR_BG_DARK));
+        C2D_SceneBegin(s_bottom);
+        draw_text(10, 90, 0.5f, rgba(COLOR_TEXT_PRIMARY),
+                  "Offline cache full.");
+        draw_text(10, 120, 0.45f, rgba(COLOR_TEXT_SECONDARY),
+                  "Clear some downloads in Settings.");
+        C3D_FrameEnd(0);
+        svcSleepThread(1500000000LL); /* 1.5s so the message is readable */
+        return;
+    }
+
     jfin_stream_t stream;
     bool ok_url;
     if (item_is_video(item)) {
@@ -802,6 +820,12 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                 g_config.auto_advance = !g_config.auto_advance;
                 state->auto_advance = g_config.auto_advance;
             } else if (state->settings_index == SET_CACHE_CLEAR) {
+                /* Stop any active playback first: a cached track/video may
+                 * be open via the sdmc devoptab, and deleting an open file
+                 * underneath FFmpeg/mpg123 is undefined on FAT. */
+                audio_player_stop();
+                video_player_stop();
+                state->has_now_playing = false;
                 cache_clear();
                 s_cache_bytes_ui = 0;
             } else if (state->settings_index == SET_LOGOUT) {

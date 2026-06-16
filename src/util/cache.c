@@ -16,6 +16,10 @@
 #define CACHE_MAX_ENTRIES 256
 #define CACHE_NAME_LEN    80
 
+/* Must fit a UUID-style id (36 chars) + '.' + ext + NUL, in case Jellyfin
+ * ever emits dashed GUIDs instead of 32-char hex ids. */
+_Static_assert(CACHE_NAME_LEN >= 44, "CACHE_NAME_LEN too small for UUID.ext");
+
 static char s_index[CACHE_MAX_ENTRIES][CACHE_NAME_LEN];
 static int  s_index_count;
 
@@ -101,22 +105,27 @@ void cache_index_add(const char *item_id, const char *ext)
 
 bool cache_remove(const char *item_id, const char *ext)
 {
-    char path[512];
-    if (!cache_path(item_id, ext, path, sizeof(path)))
-        return false;
-
     char name[CACHE_NAME_LEN];
     make_name(item_id, ext, name, sizeof(name));
     int i = index_find(name);
-    if (i >= 0) {
-        s_index[i][0] = '\0';
-        /* compact: move last entry into the hole */
-        if (i != s_index_count - 1)
-            memcpy(s_index[i], s_index[s_index_count - 1], CACHE_NAME_LEN);
-        s_index_count--;
-    }
+    if (i < 0)
+        return false; /* not in our index — don't touch the filesystem */
 
+    s_index[i][0] = '\0';
+    /* compact: move last entry into the hole */
+    if (i != s_index_count - 1)
+        memcpy(s_index[i], s_index[s_index_count - 1], CACHE_NAME_LEN);
+    s_index_count--;
+
+    char path[512];
+    if (!cache_path(item_id, ext, path, sizeof(path)))
+        return false;
     return remove(path) == 0;
+}
+
+bool cache_is_full(void)
+{
+    return s_index_count >= CACHE_MAX_ENTRIES;
 }
 
 uint64_t cache_total_bytes(void)

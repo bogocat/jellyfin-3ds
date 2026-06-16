@@ -177,7 +177,17 @@ static void local_file_to_ring(const char *path)
     u8 buf[8192];
     while (!s_player.stop_requested) {
         size_t n = fread(buf, 1, sizeof(buf), f);
-        if (n == 0) break; /* EOF or read error */
+        if (n == 0) {
+            /* Distinguish a real SD read error (bad sector, card pulled)
+             * from a clean EOF — otherwise a truncated read looks like a
+             * normal end-of-track and the user sees no error. */
+            if (ferror(f)) {
+                snprintf(s_player.error_msg, sizeof(s_player.error_msg),
+                         "SD read error");
+                s_player.state = PLAYER_ERROR;
+            }
+            break;
+        }
         size_t written = 0;
         while (written < n && !s_player.stop_requested) {
             written += ring_write(&s_player.ring, buf + written, n - written);
