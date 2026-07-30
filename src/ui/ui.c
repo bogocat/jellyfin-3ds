@@ -99,6 +99,24 @@ static const char *item_cache_ext(const jfin_item_t *item)
  * (cache_total_bytes walks the SD directory) */
 static u64 s_cache_bytes_ui;
 
+/* Re-select sticky subtitle language on episode change; clears if no match. */
+static void apply_sticky_subtitle(ui_state_t *state, const jfin_session_t *session,
+                                  const char *item_id)
+{
+    state->subtitle_stream_index = -1;
+    state->subtitle_list_loaded = false;
+    if (!state->subtitle_sticky || state->subtitle_lang_pref[0] == '\0') return;
+    if (!jfin_get_subtitle_streams(session, item_id, &state->subtitle_list)) return;
+    state->subtitle_list_loaded = true;
+    for (int i = 0; i < state->subtitle_list.count; i++) {
+        if (strcmp(state->subtitle_list.subs[i].language,
+                   state->subtitle_lang_pref) == 0) {
+            state->subtitle_stream_index = state->subtitle_list.subs[i].index;
+            return;
+        }
+    }
+}
+
 /**
  * Start playback of a playable item, preferring the offline cache.
  * Covers: video with audio-stream fallback, audio/Old-3DS path, playback
@@ -116,15 +134,16 @@ static bool ui_start_item(ui_state_t *state, const jfin_session_t *session,
     if (item_is_video(item) && video_player_is_supported()) {
         vp_3d_mode_t mode_3d = item_3d_mode(item);
         audio_player_stop();
+        apply_sticky_subtitle(state, session, item->id);
         if (cache_has(item->id, "ts") &&
             cache_path(item->id, "ts", cpath, sizeof(cpath))) {
-            /* Local files seek in-place, so start_ticks passes through */
-            started = video_player_play(cpath, item->runtime_ticks,
+            started = video_player_play(cpath, NULL, item->runtime_ticks,
                                         start_ticks, mode_3d);
         } else if (jfin_get_video_stream(session, item->id, start_ticks,
-                                         mode_3d != VP_3D_NONE, &stream)) {
-            started = video_player_play(stream.url, item->runtime_ticks,
-                                        start_ticks, mode_3d);
+                                         mode_3d != VP_3D_NONE,
+                                         state->subtitle_stream_index, &stream)) {
+            started = video_player_play(stream.url, stream.subtitle_url,
+                                        item->runtime_ticks, start_ticks, mode_3d);
         }
     }
 
@@ -243,7 +262,7 @@ static void ui_download_item(const jfin_session_t *session,
     if (item_is_video(item)) {
         vp_3d_mode_t mode_3d = item_3d_mode(item);
         ok_url = jfin_get_video_stream(session, item->id, 0,
-                                       mode_3d != VP_3D_NONE, &stream);
+                                       mode_3d != VP_3D_NONE, -1, &stream);
     } else {
         ok_url = jfin_get_audio_stream(session, item->id, 0, &stream);
     }
@@ -759,6 +778,58 @@ void ui_update(ui_state_t *state, const jfin_session_t *session,
                 state->auto_stopped = true;
                 state->current_view = state->previous_view;
             }
+            /* Y (video): cycle subtitle tracks (Off → track[0] → … → Off) */
+            if ((kdown & KEY_Y) && vid_active) {
+                if (!state->subtitle_list_loaded) {
+                    if (jfin_get_subtitle_streams(session, state->now_playing.id,
+                                                  &state->subtitle_list))
+                        state->subtitle_list_loaded = true;
+                }
+                int next_index = -1;
+                if (state->subtitle_stream_index < 0) {
+                    if (state->subtitle_list_loaded && state->subtitle_list.count > 0)
+                        next_index = state->subtitle_list.subs[0].index;
+                } else {
+                    int cur_pos = -1;
+                    for (int si = 0; si < state->subtitle_list.count; si++) {
+                        if (state->subtitle_list.subs[si].index == state->subtitle_stream_index) {
+                            cur_pos = si; break;
+                        }
+                    }
+                    if (cur_pos < 0 || cur_pos >= state->subtitle_list.count - 1)
+                        next_index = -1;
+                    else
+                        next_index = state->subtitle_list.subs[cur_pos + 1].index;
+                }
+                state->subtitle_stream_index = next_index;
+                if (next_index >= 0) {
+                    state->subtitle_sticky = true;
+                    for (int si = 0; si < state->subtitle_list.count; si++) {
+                        if (state->subtitle_list.subs[si].index == next_index) {
+                            snprintf(state->subtitle_lang_pref,
+                                     sizeof(state->subtitle_lang_pref),
+                                     "%s", state->subtitle_list.subs[si].language);
+                            break;
+                        }
+                    }
+                } else {
+                    state->subtitle_sticky = false;
+                    state->subtitle_lang_pref[0] = '\0';
+                }
+                int64_t resume_ticks = vs.position_ticks;
+                vp_3d_mode_t sub_mode = item_3d_mode(&state->now_playing);
+                video_player_stop();
+                state->video_retry_count = 0;
+                state->video_retry_timer = 0;
+                state->video_retry_ticks = resume_ticks;
+                jfin_stream_t sub_stream;
+                if (jfin_get_video_stream(session, state->now_playing.id, resume_ticks,
+                                          sub_mode != VP_3D_NONE,
+                                          state->subtitle_stream_index, &sub_stream))
+                    video_player_play(sub_stream.url, sub_stream.subtitle_url,
+                                      state->now_playing.runtime_ticks,
+                                      resume_ticks, sub_mode);
+            }
             /* Auto-advance from now-playing screen */
             if (state->has_now_playing && state->auto_advance && !state->auto_stopped) {
                 player_status_t ps = audio_player_get_status();
@@ -1050,6 +1121,77 @@ void ui_render_browse(const ui_state_t *state)
         draw_text(10, 220, 0.4f, rgba(COLOR_TEXT_SECONDARY), "A:Sel B:Back X:DL Y:Play SEL:Srch");
 }
 
+#define SUB_SCALE 0.55f
+#define SUB_LINE_H 14.0f
+
+static void draw_subtitles_top(void)
+{
+    vp_subtitle_t subs[4];
+    int sub_count = video_player_get_subtitles(subs, 4);
+    if (!sub_count) return;
+
+    u32 outline = C2D_Color32(0, 0, 0, 200);
+
+    for (int si = 0; si < sub_count; si++) {
+        const vp_subtitle_t *s = &subs[si];
+        u32 fg = s->color ? s->color : C2D_Color32(255, 255, 255, 255);
+
+        int nlines = 1;
+        for (const char *q = s->text; *q; q++) if (*q == '\n') nlines++;
+
+        int row = (s->alignment - 1) / 3;
+        float ax = (s->screen_x >= 0.0f) ? s->screen_x : 200.0f;
+        float ay;
+        if (s->screen_y >= 0.0f) ay = s->screen_y;
+        else if (row == 2)        ay = 8.0f;
+        else if (row == 1)        ay = 120.0f;
+        else                      ay = 226.0f;
+
+        float block_h = nlines * SUB_LINE_H;
+        float line_y;
+        if (row == 0)      line_y = ay - block_h;
+        else if (row == 1) line_y = ay - block_h / 2.0f;
+        else               line_y = ay;
+
+        const char *lp = s->text;
+        while (lp && *lp) {
+            const char *nl = strchr(lp, '\n');
+            int ll = nl ? (int)(nl - lp) : (int)strlen(lp);
+
+            char lbuf[260];
+            if (ll >= (int)sizeof(lbuf)) ll = sizeof(lbuf) - 1;
+            memcpy(lbuf, lp, ll);
+            lbuf[ll] = '\0';
+
+            C2D_Text ct;
+            C2D_TextParse(&ct, s_text_buf, lbuf);
+            C2D_TextOptimize(&ct);
+
+            float tw = 0, th = 0;
+            C2D_TextGetDimensions(&ct, SUB_SCALE, SUB_SCALE, &tw, &th);
+            (void)th;
+
+            int col = (s->alignment - 1) % 3;
+            float lx;
+            if (col == 0)      lx = ax;
+            else if (col == 1) lx = ax - tw / 2.0f;
+            else               lx = ax - tw;
+
+            if (lx < 2.0f) lx = 2.0f;
+            if (lx + tw > 398.0f) lx = 398.0f - tw;
+
+            C2D_DrawText(&ct, C2D_WithColor, lx-1, line_y-1, 0.5f, SUB_SCALE, SUB_SCALE, outline);
+            C2D_DrawText(&ct, C2D_WithColor, lx+1, line_y-1, 0.5f, SUB_SCALE, SUB_SCALE, outline);
+            C2D_DrawText(&ct, C2D_WithColor, lx-1, line_y+1, 0.5f, SUB_SCALE, SUB_SCALE, outline);
+            C2D_DrawText(&ct, C2D_WithColor, lx+1, line_y+1, 0.5f, SUB_SCALE, SUB_SCALE, outline);
+            C2D_DrawText(&ct, C2D_WithColor, lx,   line_y,   0.5f, SUB_SCALE, SUB_SCALE, fg);
+
+            line_y += SUB_LINE_H;
+            lp = nl ? nl + 1 : NULL;
+        }
+    }
+}
+
 void ui_render_now_playing(const ui_state_t *state, const player_status_t *player)
 {
     video_status_t vstatus = video_player_get_status();
@@ -1081,12 +1223,14 @@ void ui_render_now_playing(const ui_state_t *state, const player_status_t *playe
     } else if (is_video) {
         /* Render video frame on top screen */
         video_player_render_frame();
+        draw_subtitles_top();
 
         /* Right eye for stereoscopic 3D (only when 3D slider is up) */
         if (vstatus.is_3d && osGet3DSliderState() > 0.0f) {
             C2D_TargetClear(s_top_right, rgba(0x000000FF));
             C2D_SceneBegin(s_top_right);
             video_player_render_frame_right();
+            draw_subtitles_top();
         }
     } else if (player->state == PLAYER_LOADING) {
         /* Show buffering indicator while audio is loading */
@@ -1172,7 +1316,7 @@ void ui_render_now_playing(const ui_state_t *state, const player_status_t *playe
     snprintf(buf_str, sizeof(buf_str), "Buffer: %d%%", buf_pct);
     draw_text(115, 100, 0.4f, rgba(COLOR_TEXT_SECONDARY), buf_str);
 
-    /* Diagnostics for video playback */
+    /* Diagnostics and subtitle status for video playback */
     if (is_video) {
         char diag[80];
         snprintf(diag, sizeof(diag), "%sDec: %.0f fps  Disp: %.0f fps  %dx%d",
@@ -1180,11 +1324,34 @@ void ui_render_now_playing(const ui_state_t *state, const player_status_t *playe
                  vstatus.decode_fps, vstatus.display_fps,
                  vstatus.video_width, vstatus.video_height);
         draw_text(30, 125, 0.38f, rgba(COLOR_TEXT_SECONDARY), diag);
+
+        char sub_str[48];
+        if (state->subtitle_stream_index >= 0) {
+            const char *label = state->subtitle_lang_pref[0] ? state->subtitle_lang_pref : "on";
+            for (int i = 0; i < state->subtitle_list.count; i++) {
+                if (state->subtitle_list.subs[i].index == state->subtitle_stream_index) {
+                    label = state->subtitle_list.subs[i].language[0] ?
+                            state->subtitle_list.subs[i].language :
+                            state->subtitle_list.subs[i].title;
+                    break;
+                }
+            }
+            snprintf(sub_str, sizeof(sub_str), "Subs: %s", label);
+        } else {
+            snprintf(sub_str, sizeof(sub_str), "Subs: off");
+        }
+        u32 sub_color = (state->subtitle_stream_index >= 0) ?
+                        rgba(COLOR_ACCENT) : rgba(COLOR_TEXT_SECONDARY);
+        draw_text(30, 145, 0.4f, sub_color, sub_str);
     }
 
     /* Controls hint */
-    draw_text(20, 180, 0.45f, rgba(COLOR_TEXT_PRIMARY),
-              "A:Pause X:Stop B:Back L/R:Seek");
+    if (is_video)
+        draw_text(20, 180, 0.45f, rgba(COLOR_TEXT_PRIMARY),
+                  "A:Pause X:Stop B:Back L/R:Seek Y:Subs");
+    else
+        draw_text(20, 180, 0.45f, rgba(COLOR_TEXT_PRIMARY),
+                  "A:Pause X:Stop B:Back L/R:Seek");
 }
 
 void ui_render_settings(const ui_state_t *state, const jfin_session_t *session)

@@ -16,6 +16,17 @@
 extern "C" {
 #endif
 
+/* One subtitle cue parsed from an ASS track */
+typedef struct {
+    int64_t  start_ticks;  /* show time when cue becomes visible */
+    int64_t  end_ticks;    /* show time when cue disappears */
+    char     text[256];    /* display text; '\n' separates lines */
+    float    screen_x;     /* -1 = use default position */
+    float    screen_y;     /* -1 = use default position */
+    int      alignment;    /* ASS numpad alignment 1-9, default 2 */
+    uint32_t color;        /* C2D_Color32 value; 0 = default white */
+} vp_subtitle_t;
+
 typedef enum {
     VIDEO_STOPPED,
     VIDEO_LOADING,
@@ -64,9 +75,11 @@ void video_player_cleanup(void);
 
 /**
  * Start video playback from a TS stream URL.
+ * subtitle_url: URL to download an ASS subtitle file; NULL or empty = none.
  * seek_offset_ticks: position in the original media this stream starts from.
  */
-bool video_player_play(const char *url, int64_t duration_ticks,
+bool video_player_play(const char *url, const char *subtitle_url,
+                       int64_t duration_ticks,
                        int64_t seek_offset_ticks, vp_3d_mode_t mode_3d);
 
 /**
@@ -83,6 +96,24 @@ void video_player_pause(void);
  * Get current status. Safe to call from any thread.
  */
 video_status_t video_player_get_status(void);
+
+/**
+ * Fill out[] with subtitle cues active at the current playback position.
+ * Returns the number of cues written (at most max_count).
+ * Call from the main thread only (same thread as video_player_play).
+ */
+int video_player_get_subtitles(vp_subtitle_t *out, int max_count);
+
+/**
+ * Clear currently loaded subtitle cues (turns subtitles off without restarting playback).
+ */
+void video_player_clear_subtitles(void);
+
+/**
+ * Load subtitle cues from a URL or sdmc:/ path (without restarting playback).
+ * Replaces any previously loaded cues.
+ */
+void video_player_load_subtitles(const char *url);
 
 /**
  * Must be called each frame from the main loop.

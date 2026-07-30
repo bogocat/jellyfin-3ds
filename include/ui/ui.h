@@ -92,6 +92,18 @@ typedef struct {
     /* Settings */
     int          settings_index;   /* cursor position in settings list */
     int          settings_scroll;  /* scroll offset */
+
+    /* Subtitle state */
+    int                  subtitle_stream_index; /* active stream index, -1 = off */
+    jfin_subtitle_list_t subtitle_list;         /* cached tracks for current item */
+    bool                 subtitle_list_loaded;  /* true when subtitle_list is valid */
+    bool                 subtitle_sticky;       /* carry language pref to next episode */
+    char                 subtitle_lang_pref[8]; /* ISO 639-2 language to match (e.g. "eng") */
+
+    /* Auto-retry state for subtitle transcode startup delay */
+    int                  video_retry_count;  /* retries attempted for current play (max 3) */
+    int                  video_retry_timer;  /* countdown frames before next retry */
+    int64_t              video_retry_ticks;  /* seek position to use on retry */
 } ui_state_t;
 
 /* ── Lifecycle ───────────────────────────────────────────────────── */

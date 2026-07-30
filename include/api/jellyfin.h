@@ -24,6 +24,8 @@ extern "C" {
 #define JFIN_MAX_ITEMS        50   /* max items per page */
 #define JFIN_IMAGE_MAX_WIDTH  400  /* top screen width */
 #define JFIN_IMAGE_MAX_HEIGHT 240  /* top screen height */
+#define JFIN_MAX_SUBTITLES    10
+#define JFIN_SUBTITLE_TITLE   64
 
 /* ── Types ─────────────────────────────────────────────────────────── */
 
@@ -70,10 +72,23 @@ typedef struct {
 } jfin_item_list_t;
 
 typedef struct {
+    int  index;
+    char language[8];
+    char title[JFIN_SUBTITLE_TITLE];
+    bool is_default;
+    bool is_forced;
+} jfin_subtitle_t;
+
+typedef struct {
+    jfin_subtitle_t subs[JFIN_MAX_SUBTITLES];
+    int count;
+} jfin_subtitle_list_t;
+
+typedef struct {
     char url[JFIN_URL_BUF];          /* ready-to-fetch stream URL */
     char container[32];              /* "mp3", "opus", "ts", etc. */
+    char subtitle_url[JFIN_URL_BUF]; /* ASS subtitle download URL, empty = none */
     bool is_transcoding;
-    
 } jfin_stream_t;
 
 typedef struct {
@@ -168,12 +183,35 @@ bool jfin_get_audio_stream(const jfin_session_t *session, const char *item_id,
 
 /**
  * Get a video stream URL. start_ticks = 0 for beginning, or seek position.
+ * subtitle_stream_index: pass >= 0 to enable client-side subtitle rendering;
+ * out->subtitle_url is populated with the ASS download URL. Pass -1 for none.
+ * Subtitles are NOT burned into the video stream (no SubtitleMethod=Encode).
  */
 bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
                            int64_t start_ticks, bool is_3d,
+                           int subtitle_stream_index,
                            jfin_stream_t *out);
 
+/**
+ * Get a video stream URL with subtitles burned into the transcode (hardcoded).
+ * subtitle_stream_index must be >= 0; returns false otherwise.
+ * Appends SubtitleStreamIndex + SubtitleMethod=Encode and forces StartTimeTicks=1
+ * to prevent Jellyfin from falling back to a direct stream (which ignores encode).
+ * out->subtitle_url is always empty — subtitles are baked into the video stream.
+ */
+bool jfin_get_video_stream_encoded(const jfin_session_t *session, const char *item_id,
+                                   int subtitle_stream_index,
+                                   jfin_stream_t *out);
 
+/* ── Subtitles ─────────────────────────────────────────────────────── */
+
+/**
+ * Fetch the list of subtitle tracks available for item_id.
+ * Populates out->subs[] with language, title, index, default/forced flags.
+ * Returns false (and leaves out empty) if the item has no subtitle streams.
+ */
+bool jfin_get_subtitle_streams(const jfin_session_t *session, const char *item_id,
+                               jfin_subtitle_list_t *out);
 
 /* ── Images ────────────────────────────────────────────────────────── */
 

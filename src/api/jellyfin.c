@@ -535,6 +535,7 @@ bool jfin_get_audio_stream(const jfin_session_t *session, const char *item_id,
 
 bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
                            int64_t start_ticks, bool is_3d,
+                           int subtitle_stream_index,
                            jfin_stream_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -571,21 +572,112 @@ bool jfin_get_video_stream(const jfin_session_t *session, const char *item_id,
              item_id, (unsigned long)(tick & 0xFFFFFFFF), session->access_token);
 
     if (start_ticks > 0 && len > 0 && len < (int)sizeof(out->url) - 40) {
-        /* The base URL above already carries a PlaySessionId that is
-         * unique per call (fresh tick), which is what busts Jellyfin's
-         * per-item+device transcode cache on seek. Appending a second
-         * PlaySessionId here (the old behavior) sent two different
-         * session ids in one request. */
-        snprintf(out->url + len, sizeof(out->url) - len,
+        len += snprintf(out->url + len, sizeof(out->url) - len,
                  "&StartTimeTicks=%lld", (long long)start_ticks);
         log_write("SEEK: StartTimeTicks=%lld session=3ds%08lx",
                   (long long)start_ticks, (unsigned long)(tick & 0xFFFFFFFF));
     }
 
+    if (subtitle_stream_index >= 0)
+        snprintf(out->subtitle_url, sizeof(out->subtitle_url),
+                 "%s/Videos/%s/%s/Subtitles/%d/0/Stream.ass?api_key=%s",
+                 session->server_url, item_id, item_id,
+                 subtitle_stream_index, session->access_token);
+
     snprintf(out->container, sizeof(out->container), "%s", "ts");
     out->is_transcoding = true;
 
     return true;
+}
+
+bool jfin_get_video_stream_encoded(const jfin_session_t *session, const char *item_id,
+                                   int subtitle_stream_index,
+                                   jfin_stream_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (subtitle_stream_index < 0) return false;
+
+    u64 tick = svcGetSystemTick();
+    snprintf(out->url, sizeof(out->url),
+             "%s/Videos/%s/stream?UserId=%s&DeviceId=%s"
+             "&VideoCodec=h264"
+             "&AudioCodec=aac"
+             "&Container=ts"
+             "&MaxWidth=400&MaxHeight=240"
+             "&VideoBitRate=%d"
+             "&AudioBitRate=%d"
+             "&MaxAudioChannels=2"
+             "&TranscodingMaxAudioChannels=2"
+             "&Profile=Baseline"
+             "&Level=31"
+             "&MaxRefFrames=2"
+             "&MediaSourceId=%s"
+             "&PlaySessionId=3ds%08lx"
+             "&api_key=%s"
+             "&StartTimeTicks=1"
+             "&SubtitleStreamIndex=%d"
+             "&SubtitleMethod=Encode",
+             session->server_url, item_id, session->user_id,
+             session->device_id,
+             g_config.video_bitrate * 1000, g_config.audio_bitrate * 1000,
+             item_id, (unsigned long)(tick & 0xFFFFFFFF), session->access_token,
+             subtitle_stream_index);
+
+    snprintf(out->container, sizeof(out->container), "%s", "ts");
+    out->is_transcoding = true;
+    /* subtitle_url intentionally empty — subtitles are baked into the stream */
+    return true;
+}
+
+bool jfin_get_subtitle_streams(const jfin_session_t *session, const char *item_id,
+                               jfin_subtitle_list_t *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    char url[JFIN_URL_BUF];
+    snprintf(url, sizeof(url),
+             "%s/Items/%s?UserId=%s&Fields=MediaStreams",
+             session->server_url, item_id, session->user_id);
+
+    cJSON *root = api_get(session, url);
+    if (!root) return false;
+
+    cJSON *sources = cJSON_GetObjectItemCaseSensitive(root, "MediaSources");
+    if (!cJSON_IsArray(sources) || cJSON_GetArraySize(sources) == 0) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *source = cJSON_GetArrayItem(sources, 0);
+    cJSON *streams = cJSON_GetObjectItemCaseSensitive(source, "MediaStreams");
+    if (!cJSON_IsArray(streams)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    cJSON *stream;
+    cJSON_ArrayForEach(stream, streams) {
+        if (out->count >= JFIN_MAX_SUBTITLES) break;
+        cJSON *type = cJSON_GetObjectItemCaseSensitive(stream, "Type");
+        if (!cJSON_IsString(type) || strcmp(type->valuestring, "Subtitle") != 0)
+            continue;
+        jfin_subtitle_t *s = &out->subs[out->count++];
+        cJSON *idx  = cJSON_GetObjectItemCaseSensitive(stream, "Index");
+        cJSON *lang = cJSON_GetObjectItemCaseSensitive(stream, "Language");
+        cJSON *disp = cJSON_GetObjectItemCaseSensitive(stream, "DisplayTitle");
+        cJSON *def  = cJSON_GetObjectItemCaseSensitive(stream, "IsDefault");
+        cJSON *forc = cJSON_GetObjectItemCaseSensitive(stream, "IsForced");
+        s->index      = cJSON_IsNumber(idx) ? (int)idx->valuedouble : 0;
+        s->is_default = cJSON_IsTrue(def);
+        s->is_forced  = cJSON_IsTrue(forc);
+        if (cJSON_IsString(lang))
+            snprintf(s->language, sizeof(s->language), "%s", lang->valuestring);
+        if (cJSON_IsString(disp))
+            snprintf(s->title, sizeof(s->title), "%s", disp->valuestring);
+    }
+
+    cJSON_Delete(root);
+    return out->count > 0;
 }
 
 void jfin_get_image_url_for_item(const jfin_session_t *session,

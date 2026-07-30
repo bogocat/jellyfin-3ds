@@ -14,8 +14,17 @@
 #include <libavutil/opt.h>
 
 #include "video/ffmpeg_demux.h"
+#include "util/log.h"
 
 #define AVIO_BUF_SIZE (64 * 1024)  /* 64KB AVIO read buffer */
+
+/* Last valid video dimensions seen across any session.
+ * When avformat_find_stream_info returns 0x0 (SPS not in probe window — common
+ * after seeks on both local and online streams), we fall back to these so the
+ * MVD is initialised with real dimensions.  Without this fallback every NAL
+ * fails with 0xD96170CA because MVD rejects all input when width/height = 0. */
+static int s_cached_width  = 0;
+static int s_cached_height = 0;
 
 /* ── Ring buffer read (called by FFmpeg's AVIO) ────────────────────── */
 
@@ -27,8 +36,12 @@ static int ring_read_for_avio(void *opaque, uint8_t *buf, int buf_size)
     int waited = 0;
     while (__atomic_load_n(&ctx->ring_fill, __ATOMIC_ACQUIRE) < buf_size
            && !__atomic_load_n(&ctx->ring_finished, __ATOMIC_ACQUIRE)) {
-        if (waited > 15000) /* 15 seconds — allows net thread retries on WiFi drops */
+        if (waited > 15000) { /* 15 seconds — allows net thread retries on WiFi drops */
+            log_write("DEC: ring_read_for_avio TIMEOUT (15s), fill=%d finished=%d",
+                      __atomic_load_n(&ctx->ring_fill, __ATOMIC_ACQUIRE),
+                      __atomic_load_n(&ctx->ring_finished, __ATOMIC_ACQUIRE));
             return AVERROR_EOF;
+        }
         svcSleepThread(1000000LL); /* 1ms */
         waited++;
     }
@@ -60,10 +73,14 @@ bool demux_init(demux_ctx_t *ctx)
 
     const AVInputFormat *input_fmt = av_find_input_format("mpegts");
 
-    /* Speed up format detection: 32KB probe + 0.5s analysis is enough for TS */
+    /* Large probe budget: subtitle burn-in transcodes delay video output by
+     * 2-5s while the server-side filter chain initialises, so we must wait
+     * for enough data to include the first video packet with SPS/PPS.
+     * For normal streams these limits are never reached (probe exits early
+     * once all stream info is found). */
     AVDictionary *opts = NULL;
-    av_dict_set(&opts, "probesize", "32768", 0);
-    av_dict_set(&opts, "analyzeduration", "500000", 0);
+    av_dict_set(&opts, "probesize", "524288", 0);
+    av_dict_set(&opts, "analyzeduration", "10000000", 0);
 
     if (ctx->local_path) {
         /* Cached file on SD: open via FFmpeg's file protocol (newlib
@@ -127,11 +144,20 @@ bool demux_init(demux_ctx_t *ctx)
     for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
         AVCodecParameters *par = fmt_ctx->streams[i]->codecpar;
         if (par->codec_type == AVMEDIA_TYPE_VIDEO && ctx->video_stream_idx < 0) {
-            ctx->video_stream_idx = i;
-            ctx->video_width = par->width;
-            ctx->video_height = par->height;
-            ctx->video_extradata = par->extradata;
+            ctx->video_stream_idx     = i;
+            ctx->video_width          = par->width;
+            ctx->video_height         = par->height;
+            ctx->video_extradata      = par->extradata;
             ctx->video_extradata_size = par->extradata_size;
+            if (ctx->video_width > 0 && ctx->video_height > 0) {
+                s_cached_width  = ctx->video_width;
+                s_cached_height = ctx->video_height;
+            } else if (s_cached_width > 0) {
+                ctx->video_width  = s_cached_width;
+                ctx->video_height = s_cached_height;
+                log_write("DEC: dimensions 0x0 from probe — using cached %dx%d",
+                          s_cached_width, s_cached_height);
+            }
         } else if (par->codec_type == AVMEDIA_TYPE_AUDIO && ctx->audio_stream_idx < 0) {
             ctx->audio_stream_idx = i;
             ctx->audio_sample_rate = par->sample_rate;
